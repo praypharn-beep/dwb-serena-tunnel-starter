@@ -1,0 +1,19 @@
+name: Validate public starter
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run public-readiness checks
+        shell: powershell
+        run: .\tests\validate.ps1
