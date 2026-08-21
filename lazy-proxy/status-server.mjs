@@ -6,7 +6,7 @@ const STATUS_KEYS = [
 ];
 
 function isLoopbackHost(host) {
-  return host === '127.0.0.1' || host === '::1';
+  return host === '127.0.0.1';
 }
 
 function statusBody(snapshotProvider) {
@@ -26,7 +26,7 @@ function write(response, statusCode, contentType, body) {
 const UI = '<!doctype html><meta charset="utf-8"><title>Lazy Serena status</title><pre id="status">Loading…</pre><script>fetch("/status",{cache:"no-store"}).then(r=>r.json()).then(v=>document.getElementById("status").textContent=JSON.stringify(v,null,2)).catch(()=>document.getElementById("status").textContent="Status unavailable")</script>';
 
 export async function startStatusServer({ host, port, snapshotProvider }) {
-  if (!isLoopbackHost(host)) throw new RangeError('Status server host must be a loopback address');
+  if (!isLoopbackHost(host)) throw new RangeError('Status server host must be the 127.0.0.1 loopback address');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new RangeError('Status server port must be between 0 and 65535');
   if (typeof snapshotProvider !== 'function') throw new TypeError('snapshotProvider must be a function');
 

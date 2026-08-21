@@ -64,3 +64,10 @@ test('refuses non-loopback status hosts', async () => {
     /loopback/i,
   );
 });
+
+test('refuses IPv6 loopback because the status endpoint is IPv4 localhost only', async () => {
+  await assert.rejects(
+    startStatusServer({ host: '::1', port: 0, snapshotProvider: () => statusSnapshot }),
+    /127\.0\.0\.1/i,
+  );
+});
