@@ -1,0 +1,10 @@
+{
+  "name": "dwb-serena-tunnel-starter",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test lazy-proxy/test/*.test.mjs",
+    "test:proxy": "node --test lazy-proxy/test/proxy.integration.test.mjs"
+  }
+}

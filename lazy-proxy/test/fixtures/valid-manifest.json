@@ -1,0 +1,12 @@
+{
+  "manifestVersion": 1,
+  "serenaVersion": "1.7.0",
+  "protocolVersion": "2025-06-18",
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read a file",
+      "inputSchema": { "type": "object" }
+    }
+  ]
+}
