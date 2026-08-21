@@ -5,6 +5,7 @@ import { createJsonLineReader, writeJsonLine } from './protocol.mjs';
 import { compareToolLists } from './manifest.mjs';
 
 const STDERR_LIMIT_BYTES = 16 * 1024;
+const DEFAULT_MAX_QUEUED_CALLS = 32;
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -31,9 +32,17 @@ function defaultClock() {
     clearTimeout: timer => clearTimeout(timer),
   };
 }
+function defaultTaskkill(pid) {
+  return new Promise((resolve, reject) => {
+    execFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], error => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
 
 export class SerenaProcessManager extends EventEmitter {
-  constructor({ command, args, manifest, startupTimeoutMs, idleTimeoutMs, shutdownGraceMs, spawnImpl = spawnChild, clock = defaultClock() }) {
+  constructor({ command, args, manifest, startupTimeoutMs, idleTimeoutMs, shutdownGraceMs, spawnImpl = spawnChild, clock = defaultClock(), taskkillImpl = defaultTaskkill, maxQueuedCalls = DEFAULT_MAX_QUEUED_CALLS }) {
     super();
     this.command = command;
     this.args = args;
@@ -44,6 +53,8 @@ export class SerenaProcessManager extends EventEmitter {
     this.spawnImpl = spawnImpl;
     this.clock = clock;
 
+    this.taskkillImpl = taskkillImpl;
+    this.maxQueuedCalls = Number.isSafeInteger(maxQueuedCalls) && maxQueuedCalls > 0 ? maxQueuedCalls : DEFAULT_MAX_QUEUED_CALLS;
     this.state = 'stopped';
     this.child = null;
     this.reader = null;
@@ -52,12 +63,14 @@ export class SerenaProcessManager extends EventEmitter {
     this.shutdownPromise = null;
     this.callTail = Promise.resolve();
     this.inFlight = 0;
+    this.queuedCalls = 0;
     this.lastActivityAt = null;
     this.idleDeadline = null;
     this.idleTimer = null;
     this.lastError = null;
     this.manifestCompatible = null;
     this.stderrTail = '';
+    this.stderrBuffer = '';
   }
 
   snapshot() {
@@ -89,18 +102,29 @@ export class SerenaProcessManager extends EventEmitter {
   }
 
   async callTool(requestId, params) {
-    if (this.state === 'failed') {
-      throw makeError('Serena is unavailable', { state: 'failed', reason: this.lastError });
+    if (this.state === 'failed' || this.state === 'stopping') throw this.#unavailableError();
+    if (this.queuedCalls >= this.maxQueuedCalls) {
+      throw makeError('Serena call queue is full', { state: this.state, maxQueuedCalls: this.maxQueuedCalls });
     }
+    this.queuedCalls += 1;
     const queued = this.callTail.then(async () => {
-      await this.start();
-      if (this.state === 'failed') {
-        throw makeError('Serena is unavailable', { state: 'failed', reason: this.lastError });
+      if (this.state === 'failed' || this.state === 'stopping') throw this.#unavailableError();
+      try {
+        await this.start();
+      } catch (error) {
+        if (this.state === 'failed' || this.state === 'stopping') throw this.#unavailableError();
+        throw error;
       }
+      if (this.state === 'failed' || this.state === 'stopping') throw this.#unavailableError();
       return this.#runCall(requestId, params);
     });
-    this.callTail = queued.catch(() => undefined);
-    return queued;
+    const returned = queued.finally(() => { this.queuedCalls -= 1; });
+    this.callTail = returned.catch(() => undefined);
+    return returned;
+  }
+
+  #unavailableError() {
+    return makeError('Serena is unavailable', { state: this.state, reason: this.lastError });
   }
 
   async shutdown(reason = 'shutdown requested') {
@@ -164,12 +188,13 @@ export class SerenaProcessManager extends EventEmitter {
       this.lastActivityAt = this.clock.now();
       if (this.state === 'busy') this.#setState('ready');
       if (this.inFlight === 0 && this.state === 'ready') this.#scheduleIdleShutdown();
+      this.#emitState();
     }
   }
 
   async #shutdown(reason) {
     this.#clearIdleTimer();
-    if (!this.child && !this.startPromise) {
+    if (!this.child && !this.startPromise && this.queuedCalls === 0) {
       this.#setStopped();
       return;
     }
@@ -179,8 +204,9 @@ export class SerenaProcessManager extends EventEmitter {
     } catch {
       // The queued call has already captured the relevant failure.
     }
-    await this.#terminateChild();
-    this.lastError = this.state === 'failed' ? this.lastError : null;
+    const terminated = await this.#terminateChild();
+    if (!terminated) throw makeError(this.lastError ?? 'Serena termination failed');
+    this.lastError = null;
     this.#setStopped();
   }
 
@@ -188,7 +214,7 @@ export class SerenaProcessManager extends EventEmitter {
     this.child = child;
     this.reader = createJsonLineReader(child.stdout, {
       onMessage: message => this.#onMessage(message),
-      onError: error => { this.lastError = `Invalid Serena output: ${errorMessage(error)}`; },
+      onError: error => this.#onProtocolError(error),
     });
     this.onStderr = chunk => this.#appendStderr(chunk);
     this.onChildError = error => this.#onChildExit(error);
@@ -230,7 +256,18 @@ export class SerenaProcessManager extends EventEmitter {
       this.#setState('failed');
     }
   }
+  #onProtocolError(error) {
+    const failure = makeError(`Invalid Serena output: ${errorMessage(error)}`);
+    this.lastError = failure.message;
+    this.#clearIdleTimer();
+    this.#rejectPending(failure);
+    if (this.state !== 'stopped' && this.state !== 'stopping' && this.state !== 'failed') {
+      this.#setState('failed');
+    } else {
+      this.#emitState();
+    }
 
+  }
   #request(id, method, params) {
     const child = this.child;
     if (!child?.stdin || child.stdin.destroyed) return Promise.reject(makeError('Serena process is not available'));
@@ -275,13 +312,33 @@ export class SerenaProcessManager extends EventEmitter {
 
   async #terminateChild() {
     const child = this.child;
-    if (!child) return;
+    if (!child) return true;
     this.#rejectPending(makeError('Serena process is stopping'));
     try { child.stdin?.end(); } catch { /* stdin may already be closed */ }
-    if (await this.#waitForExit(child, this.shutdownGraceMs)) return;
-    await new Promise(resolve => execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], () => resolve()));
-    await this.#waitForExit(child, this.shutdownGraceMs);
+    if (await this.#waitForExit(child, this.shutdownGraceMs) && this.#confirmChildExit(child)) return true;
+    if (this.#confirmChildExit(child)) return true;
+    try {
+      await this.taskkillImpl(child.pid);
+    } catch (error) {
+      return this.#terminationFailure(child, error);
+    }
+    if (this.#confirmChildExit(child)) return true;
+    if (await this.#waitForExit(child, this.shutdownGraceMs) && this.#confirmChildExit(child)) return true;
+    return this.#terminationFailure(child);
+  }
+  #confirmChildExit(child) {
+    if (this.child !== child) return true;
+    if (child.exitCode === null && child.signalCode === null) return false;
     this.#detachChild(child);
+    return true;
+  }
+
+  #terminationFailure(child, error) {
+    if (this.child !== child) return true;
+    this.lastError = `Serena termination failed${error ? `: ${errorMessage(error)}` : ''}`;
+    if (this.state !== 'failed') this.#setState('failed');
+    else this.#emitState();
+    return false;
   }
 
   #waitForExit(child, timeoutMs) {
@@ -299,10 +356,26 @@ export class SerenaProcessManager extends EventEmitter {
   }
 
   #appendStderr(chunk) {
-    const next = `${this.stderrTail}${sanitizeStderr(chunk)}\n`;
-    this.stderrTail = Buffer.from(next, 'utf8').subarray(-STDERR_LIMIT_BYTES).toString('utf8');
+    this.stderrBuffer += String(chunk);
+    let newlineIndex;
+    while ((newlineIndex = this.stderrBuffer.indexOf('\n')) !== -1) {
+      let line = this.stderrBuffer.slice(0, newlineIndex);
+      this.stderrBuffer = this.stderrBuffer.slice(newlineIndex + 1);
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      this.#appendStderrLine(line);
+    }
+    if (Buffer.byteLength(this.stderrBuffer, 'utf8') > STDERR_LIMIT_BYTES) {
+      this.stderrBuffer = '[stderr line truncated]';
+    }
   }
 
+  #appendStderrLine(line) {
+    this.stderrTail += `${sanitizeStderr(line)}\n`;
+    while (Buffer.byteLength(this.stderrTail, 'utf8') > STDERR_LIMIT_BYTES) {
+      this.stderrTail = this.stderrTail.slice(1);
+    }
+
+  }
   #rejectPending(error) {
     for (const { reject } of this.pending.values()) reject(error);
     this.pending.clear();
