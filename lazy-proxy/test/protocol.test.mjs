@@ -41,6 +41,23 @@ test('reader isolates malformed JSON and non-object messages', async () => {
   assert.deepEqual(seen, [{ id: 3 }]);
 });
 
+test('reader discards every chunk of an oversized line until its newline', async () => {
+  const input = new PassThrough();
+  const seen = [];
+  const errors = [];
+  createJsonLineReader(input, {
+    onMessage: value => seen.push(value),
+    onError: error => errors.push(error),
+  });
+
+  input.write('x'.repeat(1024 * 1024 + 1));
+  input.end('{"id":"must-not-be-parsed"}\n{"id":"after"}\n');
+  await nextTurn();
+
+  assert.equal(errors.length, 1);
+  assert.deepEqual(seen, [{ id: 'after' }]);
+});
+
 test('writer waits for drain when output applies backpressure', async () => {
   let chunks = '';
   const output = new Writable({
@@ -58,6 +75,21 @@ test('writer waits for drain when output applies backpressure', async () => {
 
   await writeJsonLine(output, { jsonrpc: '2.0', id: 4, method: 'ping' });
   assert.equal(chunks, '{"jsonrpc":"2.0","id":4,"method":"ping"}\n');
+});
+
+test('writer rejects non-object messages without writing them', async () => {
+  let writes = 0;
+  const output = new Writable({
+    write(chunk, encoding, callback) {
+      writes += 1;
+      callback();
+    },
+  });
+
+  for (const invalid of [undefined, null, [], 'message']) {
+    await assert.rejects(writeJsonLine(output, invalid), /object/);
+  }
+  assert.equal(writes, 0);
 });
 
 test('helpers preserve JSON-RPC ids', () => {

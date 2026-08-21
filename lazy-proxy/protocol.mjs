@@ -10,6 +10,7 @@ function asError(error) {
  */
 export function createJsonLineReader(readable, { onMessage, onError }) {
   let buffer = '';
+  let discardingOversizedLine = false;
   let closed = false;
 
   const reportError = error => {
@@ -37,6 +38,17 @@ export function createJsonLineReader(readable, { onMessage, onError }) {
   const onData = chunk => {
     if (closed) return;
     buffer += chunk;
+
+    if (discardingOversizedLine) {
+      const newlineIndex = buffer.indexOf('\n');
+      if (newlineIndex === -1) {
+        buffer = '';
+        return;
+      }
+      buffer = buffer.slice(newlineIndex + 1);
+      discardingOversizedLine = false;
+    }
+
     let newlineIndex;
     while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
       handleLine(buffer.slice(0, newlineIndex));
@@ -44,6 +56,7 @@ export function createJsonLineReader(readable, { onMessage, onError }) {
     }
     if (Buffer.byteLength(buffer, 'utf8') > MAX_LINE_BYTES) {
       buffer = '';
+      discardingOversizedLine = true;
       reportError(new Error(`JSON-RPC line exceeds ${MAX_LINE_BYTES} bytes`));
     }
   };
@@ -65,6 +78,10 @@ export function createJsonLineReader(readable, { onMessage, onError }) {
 }
 
 export function writeJsonLine(writable, message) {
+  if (message === null || Array.isArray(message) || typeof message !== 'object') {
+    return Promise.reject(new TypeError('JSON-RPC message must be an object'));
+  }
+
   return new Promise((resolve, reject) => {
     let serialized;
     try {

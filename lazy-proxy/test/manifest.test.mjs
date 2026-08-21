@@ -32,3 +32,23 @@ test('compareToolLists reports description-only changes', () => {
     changed: ['read_file'],
   });
 });
+
+test('compareToolLists ignores nested input schema key insertion order', () => {
+  const base = [{
+    name: 'read_file',
+    description: 'Read a file',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, options: { type: 'object', additionalProperties: false } } },
+  }];
+  const live = [{
+    name: 'read_file',
+    description: 'Read a file',
+    inputSchema: { properties: { options: { additionalProperties: false, type: 'object' }, path: { type: 'string' } }, type: 'object' },
+  }];
+
+  assert.deepEqual(compareToolLists(base, live), {
+    compatible: true,
+    missing: [],
+    added: [],
+    changed: [],
+  });
+});

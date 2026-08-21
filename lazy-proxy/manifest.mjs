@@ -40,12 +40,20 @@ function asMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalJson(value[key])]));
+  }
+  return value;
+}
+
 function canonicalTool(tool) {
-  return JSON.stringify({
+  return JSON.stringify(canonicalJson({
     name: tool.name,
     description: tool.description,
     inputSchema: tool.inputSchema,
-  });
+  }));
 }
 
 export function compareToolLists(manifestTools, liveTools) {
