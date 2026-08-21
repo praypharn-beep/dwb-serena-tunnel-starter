@@ -51,9 +51,28 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
     `await import(${JSON.stringify(new URL(`file:///${fakeSerenaPath.replace(/\\\\/g, '/')}`).href)});`,
     "if (process.env.HOLD_CHILD_AFTER_STDIN === 'true') setInterval(() => {}, 1000);",
   ].join('\n'));
+  let defaultLauncher = null;
+  const taskkillBootstrapPath = join(directory, 'taskkill-failure-bootstrap.cjs');
+  if (taskkillFails) {
+    await writeFile(taskkillBootstrapPath, [
+      "const childProcess = require('node:child_process');",
+      "const { syncBuiltinESMExports } = require('node:module');",
+      "const originalExecFile = childProcess.execFile;",
+      "childProcess.execFile = (file, ...arguments_) => {",
+      "  if (String(file).toLowerCase() === 'taskkill.exe') {",
+      "    const callback = arguments_.find(value => typeof value === 'function');",
+      "    queueMicrotask(() => callback?.(new Error('Injected taskkill failure')));",
+      "    return {};",
+      "  }",
+      "  return originalExecFile(file, ...arguments_);",
+      "};",
+      "syncBuiltinESMExports();",
+    ].join('\n'));
+  }
   if (useDefaultCommand) {
     await copyFile(process.execPath, join(directory, 'serena.exe'));
-    await writeFile(join(directory, 'start-mcp-server'), `await import(${JSON.stringify(new URL(`file:///${wrapperPath.replace(/\\/g, '/')}`).href)});`);
+    const defaultLauncher = `import(${JSON.stringify(new URL(`file:///${wrapperPath.replace(/\\/g, '/')}`).href)}).catch(error => { process.stderr.write(String(error)); process.exitCode = 1; });`;
+    await writeFile(join(directory, 'start-mcp-server'), defaultLauncher);
   }
   const cliArgs = [cliPath, '--manifest', manifestPath, '--status', '127.0.0.1:0'];
   if (!useDefaultCommand) cliArgs.push('--command', process.execPath, '--command-args', JSON.stringify([wrapperPath]));
@@ -68,8 +87,7 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
       SPAWN_MARKER: markerPath,
       EXIT_MARKER: exitMarkerPath,
       PATH: useDefaultCommand ? directory + ';' + process.env.PATH : process.env.PATH,
-      NODE_ENV: taskkillFails ? 'test' : process.env.NODE_ENV,
-      LAZY_SERENA_TEST_TASKKILL_FAIL: taskkillFails ? '1' : '',
+      NODE_OPTIONS: taskkillFails ? `${process.env.NODE_OPTIONS ?? ''} --require=${taskkillBootstrapPath}`.trim() : process.env.NODE_OPTIONS,
       HOLD_CHILD_AFTER_STDIN: holdChildAfterStdin ? 'true' : 'false',
     },
   });
@@ -111,6 +129,7 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
     status,
     stderr: () => stderr,
     child,
+    defaultLauncher,
     marker: () => existsSync(markerPath) ? readFile(markerPath, 'utf8') : '',
     exitMarker: () => downstreamExited || existsSync(exitMarkerPath),
     async close({ signal = 'SIGTERM', endInput = false } = {}) {
@@ -317,6 +336,13 @@ test('CLI defaults launch the exact Serena MCP command with approved timeouts', 
   } finally {
     await harness.close();
   }
+  const syntaxCheck = spawn(process.execPath, ['--input-type=commonjs', '--check'], { stdio: ['pipe', 'ignore', 'pipe'] });
+  let syntaxError = '';
+  syntaxCheck.stderr.setEncoding('utf8');
+  syntaxCheck.stderr.on('data', chunk => { syntaxError += chunk; });
+  syntaxCheck.stdin.end(harness.defaultLauncher);
+  const syntaxResult = await new Promise(resolve => syntaxCheck.once('exit', code => resolve(code)));
+  assert.equal(syntaxResult, 0, syntaxError);
   const { PRODUCTION_DEFAULTS } = await import('../cli.mjs');
   assert.deepEqual(PRODUCTION_DEFAULTS, { idleTimeoutMs: 900000, startupTimeoutMs: 30000, statusAddress: '127.0.0.1:18012', maxQueuedCalls: 32 });
 });
@@ -420,4 +446,9 @@ test('CLI keeps a failed-termination proxy alive and reports a nonzero shutdown 
     }
     await harness.close();
   }
+});
+
+test('shipped CLI contains no test-only taskkill failure switch', async () => {
+  const source = await readFile(cliPath, 'utf8');
+  assert.doesNotMatch(source, /LAZY_SERENA_TEST_TASKKILL_FAIL|NODE_ENV === 'test'/);
 });
