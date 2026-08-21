@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { appendFileSync } from 'node:fs';
 
 const behavior = process.env.FAKE_SERENA_BEHAVIOR ?? 'normal';
 const echoTool = {
@@ -19,6 +20,7 @@ let initialized = false;
 for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
   if (!line) continue;
   const message = JSON.parse(line);
+  if (process.env.FAKE_SERENA_TRACE_PATH) appendFileSync(process.env.FAKE_SERENA_TRACE_PATH, `${message.method}\n`);
 
   if (message.method === 'initialize') {
     if (behavior === 'slow-start') {
@@ -37,12 +39,21 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
   }
 
   if (message.method === 'tools/list') {
+    if (behavior === 'exit-before-list') process.exit(19);
     if (!initialized) {
       write({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'initialized notification required' } });
       continue;
     }
     const tools = behavior === 'mismatched-tools'
       ? [{ ...echoTool, description: 'A changed description' }]
+      : behavior === 'multi-tool-unsorted'
+      ? [
+          { name: 'zulu', description: 'Z tool', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+          echoTool,
+          { name: 'alpha', description: 'A tool', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+        ]
+      : behavior === 'invalid-tool'
+      ? [{ ...echoTool, description: 42 }]
       : [echoTool];
     respond(message.id, { tools });
     continue;
@@ -61,3 +72,4 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
     respond(message.id, { content: [{ type: 'text', text: String(message.params.arguments?.text ?? '') }] });
   }
 }
+
