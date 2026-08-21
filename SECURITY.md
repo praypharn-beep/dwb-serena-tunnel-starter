@@ -13,9 +13,36 @@ Both paths are ignored by Git.
 
 The Runtime API key is protected by Windows DPAPI only while stored on disk. `Start.cmd` decrypts it into the tunnel-client process environment for the lifetime of the process. Stop the client when it is not in use and treat local administrator access as trusted.
 
+`Lazy-Control.cmd install`/`start` inherit this same DPAPI boundary through `scripts/lazy-common.ps1`: the key is decrypted only into the tunnel-client child process's environment at launch time, for the duration of that process, and cleared from the environment immediately afterward. `scripts/lazy-control.ps1` itself never decrypts the key — `install`, `status`, `stop`, and `uninstall` never call the DPAPI decryption helper, so a bug or crash in any of those actions cannot leak the plaintext key. `status` output in particular is limited to a small allow-listed set of fields (see "Lazy proxy status boundary" below) and is checked by `tests/validate.ps1` to never reference the DPAPI secret file or its plaintext content.
+
 ## Serena access boundary
 
 Serena can provide tools that read and modify files and execute shell commands. Activate only the local project you intend to expose, use only trusted ChatGPT workspaces and tunnel principals, review tool calls, and use a sandbox or container for sensitive projects.
+
+Keeping the tunnel and lazy proxy running (even while Serena itself is idle) means any tunnel principal authenticated by the OpenAI Secure MCP Tunnel can trigger a real Serena start and issue a real tool call at any time — the 15-minute idle stop bounds how long Serena stays running after use, but it is not an access control. Treat "the tunnel is connected" as equivalent to "Serena is reachable" when deciding which workspaces and Runtime API keys to trust.
+
+## Lazy proxy: localhost-only listeners and a sanitized status boundary
+
+The lazy proxy (`lazy-proxy/`) and the tunnel's own health UI bind to `127.0.0.1` only — never to `0.0.0.0` or any non-loopback interface — so neither is reachable from the network, only from the local machine.
+
+The proxy's status endpoint (`http://127.0.0.1:18012/status`) returns exactly ten allow-listed fields: `proxy`, `serena`, `pid`, `inFlight`, `queued`, `lastActivityAt`, `idleDeadline`, `manifestVersion`, `manifestCompatible`, `lastError`. It never includes MCP tool call arguments or results, file paths, project data, the Tunnel ID, or the API key in any form. `Lazy-Control.cmd status` (and the `Get-LazyControlStatus` function behind it) reads only this same JSON plus locally-verified process identity (PID, executable path) — it never decrypts or forwards the DPAPI secret. Logs from the proxy and supervisor follow the same rule: no secrets, no tool payloads.
+
+## Serena tool manifest trust boundary
+
+`lazy-proxy/serena-tools.json` is a versioned snapshot of the tool list your locally installed Serena reported at capture time (see `lazy-proxy/scripts/capture-manifest.mjs`). The lazy proxy validates the manifest's shape on load and compares it against Serena's live tool list at Serena startup; on a mismatch it still starts Serena (so you are not blocked) but reports `manifestCompatible: false` via `/status` rather than silently trusting a manifest that no longer reflects Serena's real capabilities. The manifest itself never grants any tool capability — it only describes what the proxy will proxy through; actual tool execution is still performed by your locally installed Serena, subject to the Serena access boundary above.
+
+## Scheduled Task scope (`Lazy-Control.cmd install`)
+
+`Lazy-Control.cmd install` registers exactly one Scheduled Task, named `DWB Serena Lazy Tunnel`, scoped as follows:
+
+- **Trigger:** `AtLogOn` for the current Windows user only — it does not run for other users, does not run as SYSTEM, and does not run before any user logs on.
+- **Principal:** a **non-elevated (`Limited`) run level** for the current user. It never requests, and cannot silently escalate to, administrator rights.
+- **Action:** launches `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File scripts\lazy-supervisor.ps1` directly from the repository — never a copy, and never through `lazy-control.ps1` itself. There is exactly one task action; nothing else is registered or scheduled.
+- **Reversible:** `Lazy-Control.cmd uninstall` removes only this exact task by name; it never enumerates or touches any other Scheduled Task on the system.
+
+## PID verification before any stop or force-kill
+
+`stop` and `uninstall` never trust a PID file on its own. Before sending any stop signal, `scripts/lazy-control.ps1` re-reads the live process's executable path and full command line (via WMI/`Win32_Process`) and compares both against what the script itself would have launched (the resolved `powershell.exe` + `lazy-supervisor.ps1` path for the tunnel, the resolved `node.exe` + `lazy-proxy/cli.mjs` + the exact manifest path for the proxy). If either does not match — because the PID file is missing, stale, corrupt, or the numeric PID has been reused by an unrelated process — that PID is left completely untouched: no graceful stop request and no forced termination are ever sent to it. If a verified process does not exit within the graceful-stop timeout, the identity check is performed **a second time**, immediately before the forced termination, to close the race window where the original process could have exited and its PID number been reused by something else in the interim. This behavior is covered by dedicated tests in `tests/lazy-control.Tests.ps1`, including a simulated PID-reuse race.
 
 ## If a key is exposed
 

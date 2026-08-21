@@ -9,7 +9,7 @@ function Assert-True([bool]$Condition, [string]$Message) {
 }
 
 Write-Host 'Checking PowerShell syntax...'
-$ScriptFiles = @('setup.ps1', 'configure.ps1', 'start.ps1', 'scripts\lazy-common.ps1', 'scripts\lazy-supervisor.ps1')
+$ScriptFiles = @('setup.ps1', 'configure.ps1', 'start.ps1', 'scripts\lazy-common.ps1', 'scripts\lazy-supervisor.ps1', 'scripts\lazy-control.ps1')
 foreach ($ScriptFile in $ScriptFiles) {
     $Path = Join-Path $RepoRoot $ScriptFile
     $Tokens = $null
@@ -63,7 +63,9 @@ $RequiredLazyFiles = @(
     'lazy-proxy\serena-tools.json',
     'lazy-proxy\scripts\capture-manifest.mjs',
     'scripts\lazy-common.ps1',
-    'scripts\lazy-supervisor.ps1'
+    'scripts\lazy-supervisor.ps1',
+    'scripts\lazy-control.ps1',
+    'Lazy-Control.cmd'
 )
 foreach ($RequiredFile in $RequiredLazyFiles) {
     Assert-True (Test-Path -LiteralPath (Join-Path $RepoRoot $RequiredFile)) "Required lazy proxy file is missing: $RequiredFile"
@@ -74,6 +76,18 @@ $CliContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'lazy-proxy\cli
 Assert-True ($CliContent.Contains("statusAddress: '127.0.0.1:18012'")) 'The lazy proxy status address must default to 127.0.0.1:18012.'
 $LazyCommonContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'scripts\lazy-common.ps1')
 Assert-True ($LazyCommonContent.Contains("StatusAddress    = '127.0.0.1:18012'")) 'The launcher must render the same loopback-only status address.'
+
+Write-Host 'Checking the lazy control script and its operator wrapper...'
+$LazyControlContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'scripts\lazy-control.ps1')
+Assert-True (-not $LazyControlContent.Contains('Get-DpapiApiKey')) 'scripts\lazy-control.ps1 must never decrypt or handle the plaintext API key; install/start/status/stop/uninstall must not need it.'
+Assert-True ($LazyControlContent.Contains('Confirm-LazyProcessMatch')) 'scripts\lazy-control.ps1 must verify process identity (executable path and command line) before any stop action.'
+Assert-True ($LazyControlContent.Contains("'DWB Serena Lazy Tunnel'")) 'scripts\lazy-control.ps1 must use the exact approved Scheduled Task name.'
+Assert-True ($LazyControlContent.Contains('-RunLevel')) 'scripts\lazy-control.ps1 must explicitly set the Scheduled Task principal run level (never implicitly elevated).'
+Assert-True ($LazyControlContent -notmatch "RunLevel\s+'?Highest'?") 'scripts\lazy-control.ps1 must never register the logon task with an elevated (Highest) run level.'
+
+$LazyControlCmdContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'Lazy-Control.cmd')
+Assert-True ($LazyControlCmdContent.Contains('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lazy-control.ps1" -Action "%~1"')) 'Lazy-Control.cmd must delegate to scripts\lazy-control.ps1 using the exact specified command line.'
+Assert-True ($LazyControlCmdContent -match '(?i)usage') 'Lazy-Control.cmd must print usage text for a missing or unsupported action.'
 
 Write-Host 'Checking for forbidden secret patterns in tracked files...'
 Push-Location $RepoRoot

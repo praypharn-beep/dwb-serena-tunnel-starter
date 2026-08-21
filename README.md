@@ -151,6 +151,64 @@ Use `Setup.cmd` again if you want to refresh the local tunnel-client to the late
 
 Close the `Start.cmd` window when you are finished. The tunnel is available only while the client remains running.
 
+## On-demand Serena (lazy start)
+
+`Start.cmd` no longer launches Serena directly. It renders a tunnel profile whose MCP command is a small lazy proxy (`lazy-proxy/cli.mjs`) that sits between `tunnel-client` and Serena:
+
+```text
+ChatGPT → tunnel-client → lazy proxy → Serena (started on demand)
+```
+
+- **The tunnel and the proxy stay running** the whole time `Start.cmd` (or the lazy control stack, below) is up. Only the **Serena child process** is lazy.
+- Serena is **not** started when `Start.cmd` opens, when ChatGPT connects, or when it calls `tools/list`. It starts on the **first real `tools/call`**.
+- Serena runs as a **singleton** — concurrent calls are queued for the one Serena instance rather than starting a second one.
+- Serena **stops automatically after 15 minutes of inactivity** (`900000` ms) and restarts on the next real tool call. Expect a short delay (typically a few seconds, bounded by a 30-second startup timeout) on the first call after Serena has been idle-stopped or has never started this session.
+- **No project is activated automatically.** Activating a project is still an explicit step you take from ChatGPT (see [Activate the local project](#5-activate-the-local-project)), independent of whether Serena happens to be running.
+- The lazy proxy's tool manifest is captured once from your locally installed Serena and versioned; if Serena's own tool set doesn't match the captured manifest, the proxy still runs but reports `manifestCompatible: false` in its status so you can recapture it if needed.
+
+### Health and status URLs
+
+| URL | What it shows |
+| --- | --- |
+| `http://127.0.0.1:18010/ui` | Tunnel connection health (same as before). |
+| `http://127.0.0.1:18012/status` | Lazy proxy JSON status: `proxy`, `serena` (state), `pid`, `inFlight`, `queued`, `lastActivityAt`, `idleDeadline`, `manifestVersion`, `manifestCompatible`, `lastError`. |
+
+Both listeners are bound to `127.0.0.1` only. The status endpoint never returns secrets, MCP tool arguments/results, or project data.
+
+### A note on `Start.cmd` reliability
+
+`Start.cmd`'s preflight and tunnel launch now go through the same bounded restart supervisor used by the lazy control stack below. A native child process (`tunnel-client.exe`) writing to its own stderr can no longer be mistaken for a PowerShell error and abort the window early.
+
+## User-logon auto-start (`Lazy-Control.cmd`)
+
+For unattended, always-available access (so the tunnel/proxy come up automatically when you log in, without leaving a `Start.cmd` window open), use `Lazy-Control.cmd` instead of `Start.cmd`:
+
+```text
+Lazy-Control.cmd install     Register a current-user logon task that starts the supervisor hidden.
+Lazy-Control.cmd start       Start the tunnel/proxy supervisor right now, without installing auto-start.
+Lazy-Control.cmd status      Show tunnel/proxy/Serena status (PIDs, health URLs, idle deadline) without secrets.
+Lazy-Control.cmd stop        Stop the tunnel/proxy stack.
+Lazy-Control.cmd uninstall   Remove the logon task, stop the stack, and restore the previous tunnel profile.
+```
+
+Details:
+
+- The logon task is named **`DWB Serena Lazy Tunnel`**, triggers `AtLogOn` for the current Windows user only, runs a **hidden** PowerShell window, and is registered with a **non-elevated (Limited)** run level — it never requests administrator rights.
+- `install` and `start` render the tunnel profile from the same template `Start.cmd` uses, so the profile always points at the lazy proxy, never at Serena directly.
+- `install` **backs up the current tunnel profile** before rendering, to `%APPDATA%\tunnel-client\backups\dwb-serena.<UTC timestamp>.yaml` (for example `dwb-serena.20260821T100000Z.yaml`), before overwriting it.
+- `stop` and `uninstall` verify a managed process's **executable path and command line** before sending it any stop signal, and re-verify immediately before a forced termination. A missing, stale, or reused PID is left alone rather than acted on — see [Security](#security) below.
+- `status` never touches or displays the decrypted API key.
+
+### Rollback (byte-for-byte)
+
+If you need to return to a previous tunnel profile exactly as it was:
+
+1. Run `Lazy-Control.cmd uninstall`. This removes the logon task, stops the stack, and automatically restores the **newest valid backup** from `%APPDATA%\tunnel-client\backups\` over the active profile.
+2. To restore a specific earlier backup instead, copy the desired `dwb-serena.<timestamp>.yaml` file from `%APPDATA%\tunnel-client\backups\` over `%USERPROFILE%\.config\tunnel-client\dwb-serena.yaml`, byte for byte (do not hand-edit it).
+3. Run `Start.cmd` (or `Lazy-Control.cmd start`) again to pick up the restored profile.
+
+`install` never deletes a backup, so every profile it has ever replaced remains available under `%APPDATA%\tunnel-client\backups\` for rollback.
+
 ## Security notes
 
 - **Do not use an OpenAI Admin API key for the tunnel daemon.** Use a Runtime API key intended for tunnel use.
@@ -161,7 +219,10 @@ Close the `Start.cmd` window when you are finished. The tunnel is available only
 - Serena can expose tools that read and modify files and execute shell commands. Connect only trusted OpenAI/ChatGPT workspaces and activate only the intended local project.
 - Review tool calls before approval. For sensitive source code, run Serena in an appropriately sandboxed environment.
 - Windows DPAPI protects the API key at rest. While the tunnel is running, the key is decrypted into the tunnel-client process environment and is accessible to that process and trusted local administrators.
-- Stop `Start.cmd` whenever the tunnel is not in use.
+- Stop `Start.cmd` whenever the tunnel is not in use (or run `Lazy-Control.cmd stop` / `uninstall` if you installed the logon task).
+- The lazy proxy and tunnel-client listeners are loopback-only (`127.0.0.1`); the status endpoint (`18012`) never exposes secrets, tool arguments/results, or project paths.
+- `Lazy-Control.cmd install` registers a **user-scoped, non-elevated** logon task. `stop`/`uninstall` verify a process's executable path and command line before ever sending it a stop signal — see [SECURITY.md](SECURITY.md) for the full threat model.
+- Keeping the tunnel/proxy running (even while Serena itself is idle) still means an authenticated tunnel principal can trigger a real Serena start and tool call at any time; treat "tunnel connected" the same as "Serena reachable" from a trust perspective.
 
 ## Troubleshooting
 
@@ -205,17 +266,23 @@ tunnel-client
    │
    │ stdio
    ▼
-Serena MCP Server
+lazy-proxy (lazy-proxy/cli.mjs) — always running once the tunnel is up
+   │
+   │ starts Serena on the first real tools/call; stops it after 15 idle minutes
+   ▼
+Serena MCP Server (start-mcp-server --context chatgpt)
    │
    ▼
 Local Workspace / Project
 ```
 
-The tunnel profile launches Serena with:
+The tunnel profile's MCP command launches the lazy proxy, not Serena directly. The proxy itself launches Serena with:
 
 ```text
 serena start-mcp-server --context chatgpt
 ```
+
+only once the first real tool call arrives.
 
 ## Repository layout
 
@@ -227,14 +294,29 @@ serena-tunnel/
 ├─ configure.ps1
 ├─ Start.cmd
 ├─ start.ps1
+├─ Lazy-Control.cmd
 ├─ profiles/
 │  └─ serena-team.yaml
 ├─ config/
 │  └─ README.md
+├─ lazy-proxy/
+│  ├─ cli.mjs
+│  ├─ server.mjs
+│  ├─ status-server.mjs
+│  ├─ serena-process.mjs
+│  ├─ manifest.mjs
+│  ├─ protocol.mjs
+│  └─ serena-tools.json
+├─ scripts/
+│  ├─ lazy-common.ps1
+│  ├─ lazy-supervisor.ps1
+│  └─ lazy-control.ps1
 ├─ examples/
 │  └─ flowpilot-ai-landing-page.md
 ├─ tests/
-│  └─ validate.ps1
+│  ├─ validate.ps1
+│  ├─ lazy-launcher.Tests.ps1
+│  └─ lazy-control.Tests.ps1
 ├─ .github/workflows/
 │  └─ validate.yml
 ├─ README.md
