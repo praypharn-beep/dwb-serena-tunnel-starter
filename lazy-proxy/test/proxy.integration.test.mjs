@@ -71,10 +71,12 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
   }
   if (useDefaultCommand) {
     await copyFile(process.execPath, join(directory, 'serena.exe'));
-    const defaultLauncher = `import(${JSON.stringify(new URL(`file:///${wrapperPath.replace(/\\/g, '/')}`).href)}).catch(error => { process.stderr.write(String(error)); process.exitCode = 1; });`;
+    defaultLauncher = `import(${JSON.stringify(new URL(`file:///${wrapperPath.replace(/\\/g, '/')}`).href)}).catch(error => { process.stderr.write(String(error)); process.exitCode = 1; });`;
     await writeFile(join(directory, 'start-mcp-server'), defaultLauncher);
   }
-  const cliArgs = [cliPath, '--manifest', manifestPath, '--status', '127.0.0.1:0'];
+  const cliArgs = [];
+  if (taskkillFails) cliArgs.push('--require', taskkillBootstrapPath);
+  cliArgs.push(cliPath, '--manifest', manifestPath, '--status', '127.0.0.1:0');
   if (!useDefaultCommand) cliArgs.push('--command', process.execPath, '--command-args', JSON.stringify([wrapperPath]));
 
   const child = spawn(process.execPath, cliArgs, {
@@ -87,7 +89,6 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
       SPAWN_MARKER: markerPath,
       EXIT_MARKER: exitMarkerPath,
       PATH: useDefaultCommand ? directory + ';' + process.env.PATH : process.env.PATH,
-      NODE_OPTIONS: taskkillFails ? `${process.env.NODE_OPTIONS ?? ''} --require=${taskkillBootstrapPath}`.trim() : process.env.NODE_OPTIONS,
       HOLD_CHILD_AFTER_STDIN: holdChildAfterStdin ? 'true' : 'false',
     },
   });
@@ -333,6 +334,9 @@ test('CLI defaults launch the exact Serena MCP command with approved timeouts', 
   try {
     await harness.request('tools/call', { name: 'echo', arguments: { text: 'default' } });
     assert.match(await harness.marker(), /start-mcp-server\|--context\|chatgpt/);
+    assert.equal(typeof harness.defaultLauncher, 'string');
+    assert.ok(harness.defaultLauncher.length > 0);
+    assert.match(harness.defaultLauncher, /^import\(/);
   } finally {
     await harness.close();
   }
