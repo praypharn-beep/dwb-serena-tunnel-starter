@@ -12,6 +12,7 @@ config/*
 *.log
 *.ndjson
 .env
+.worktrees/
 .env.*
 !.env.example
 *.key
