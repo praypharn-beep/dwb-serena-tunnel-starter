@@ -165,7 +165,7 @@ Lazy-Control.cmd uninstall   ถอด logon task, หยุดการทำ�
 หากต้องการย้อนกลับไปใช้ tunnel profile เดิมทุกตัวอักษร:
 
 1. รัน `Lazy-Control.cmd uninstall` ขั้นตอนนี้จะถอด logon task, หยุดการทำงาน, และคืนค่า **backup ล่าสุดที่ยังใช้ได้** จาก `%APPDATA%\tunnel-client\backups\` ทับ profile ที่ใช้งานอยู่โดยอัตโนมัติ
-2. หากต้องการคืนค่า backup รุ่นเก่ากว่านั้นโดยเฉพาะ ให้คัดลอกไฟล์ `dwb-serena.<timestamp>.yaml` ที่ต้องการจาก `%APPDATA%\tunnel-client\backups\` ไปทับ `%USERPROFILE%\.config\tunnel-client\dwb-serena.yaml` แบบ byte-for-byte (ห้ามแก้ไขเนื้อไฟล์เอง)
+2. หากต้องการคืนค่า backup รุ่นเก่ากว่านั้นโดยเฉพาะ ให้คัดลอกไฟล์ `dwb-serena.<timestamp>.yaml` ที่ต้องการจาก `%APPDATA%\tunnel-client\backups\` ไปทับ `%APPDATA%\tunnel-client\dwb-serena.yaml` แบบ byte-for-byte (ห้ามแก้ไขเนื้อไฟล์เอง)
 3. รัน `Start.cmd` (หรือ `Lazy-Control.cmd start`) อีกครั้งเพื่อใช้ profile ที่คืนค่าแล้ว
 
 `install` จะไม่ลบ backup เก่าเลย ดังนั้น profile ทุกเวอร์ชันที่เคยถูกแทนที่จะยังอยู่ใน `%APPDATA%\tunnel-client\backups\` สำหรับ rollback เสมอ

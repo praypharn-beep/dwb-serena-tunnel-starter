@@ -133,6 +133,14 @@ mcp:
     Assert-True ($Config.StartupTimeoutMs -eq 30000) 'The approved startup timeout is 30000 ms.'
     Assert-True ($Config.StatusAddress -eq '127.0.0.1:18012') 'The approved status address is 127.0.0.1:18012.'
 
+    # Production-default regression check (not an injected mock): $Config above came from a real
+    # call to Get-LazyRuntimeConfig (only the Tunnel ID was overridden). A wrong *default* value -
+    # like the historical bug where ProfileDestinationPath pointed at $env:USERPROFILE\.config\
+    # tunnel-client\ instead of the real tunnel-client.exe profile directory, $env:APPDATA\
+    # tunnel-client\ - is exactly the class of defect a mock-only test cannot catch, since a mock
+    # never exercises the function's actual default computation.
+    Assert-True ($Config.ProfileDestinationPath -eq (Join-Path $env:APPDATA 'tunnel-client\dwb-serena.yaml')) "Get-LazyRuntimeConfig's real default ProfileDestinationPath must be the file tunnel-client.exe actually reads (%APPDATA%\tunnel-client\dwb-serena.yaml), got: $($Config.ProfileDestinationPath)"
+
     $Command = $Config.ProxyCommand
     Assert-True ($Command.Contains('node')) 'The rendered command must invoke node.'
     Assert-True ($Command.Contains('cli.mjs')) 'The rendered command must invoke lazy-proxy/cli.mjs.'

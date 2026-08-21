@@ -204,7 +204,7 @@ Details:
 If you need to return to a previous tunnel profile exactly as it was:
 
 1. Run `Lazy-Control.cmd uninstall`. This removes the logon task, stops the stack, and automatically restores the **newest valid backup** from `%APPDATA%\tunnel-client\backups\` over the active profile.
-2. To restore a specific earlier backup instead, copy the desired `dwb-serena.<timestamp>.yaml` file from `%APPDATA%\tunnel-client\backups\` over `%USERPROFILE%\.config\tunnel-client\dwb-serena.yaml`, byte for byte (do not hand-edit it).
+2. To restore a specific earlier backup instead, copy the desired `dwb-serena.<timestamp>.yaml` file from `%APPDATA%\tunnel-client\backups\` over `%APPDATA%\tunnel-client\dwb-serena.yaml`, byte for byte (do not hand-edit it).
 3. Run `Start.cmd` (or `Lazy-Control.cmd start`) again to pick up the restored profile.
 
 `install` never deletes a backup, so every profile it has ever replaced remains available under `%APPDATA%\tunnel-client\backups\` for rollback.

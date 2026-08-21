@@ -67,7 +67,7 @@ function Get-LazyRuntimeConfig {
         TunnelClientPath        = Join-Path $RepoRoot 'tunnel-client\tunnel-client.exe'
         DpapiSecretPath         = Join-Path $RepoRoot 'config\api-key.dpapi'
         ProfileTemplatePath     = Join-Path $RepoRoot 'profiles\serena-team.yaml'
-        ProfileDestinationPath  = Join-Path $env:USERPROFILE '.config\tunnel-client\dwb-serena.yaml'
+        ProfileDestinationPath  = Join-Path $env:APPDATA 'tunnel-client\dwb-serena.yaml'
         TunnelId                = $TunnelId
         IdleTimeoutMs           = $Script:LazyProductionDefaults.IdleTimeoutMs
         StartupTimeoutMs        = $Script:LazyProductionDefaults.StartupTimeoutMs

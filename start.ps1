@@ -6,7 +6,6 @@ $ProfileTemplate = Join-Path $Root 'profiles\serena-team.yaml'
 $LocalConfig = Join-Path $Root 'config\team.ps1'
 $SecretPath = Join-Path $Root 'config\api-key.dpapi'
 $ProfileName = 'dwb-serena'
-$ProfilePath = Join-Path $env:USERPROFILE ".config\tunnel-client\$ProfileName.yaml"
 
 function Fail([string]$Message) {
     Write-Host ''

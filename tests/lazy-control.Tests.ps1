@@ -445,6 +445,7 @@ try {
     $GracefulResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $StopGracefulPaths `
         -ConfigProvider { param($RepoRootArg) $StopGracefulConfig }.GetNewClosure() `
         -ProcessInspector $GracefulInspector `
+        -ProcessEnumerator { , @() }.GetNewClosure() `
         -GracefulStopper { param($ProcessId) $GracefulState.GracefulCalls += 1; $GracefulState.GracefulPid = $ProcessId }.GetNewClosure() `
         -ForceStopper { param($ProcessId) $GracefulState.ForceCalls += 1 }.GetNewClosure() `
         -GracefulTimeoutMs 2000 -PollIntervalMs 100 `
@@ -514,6 +515,7 @@ try {
     $RaceResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $StopRacePaths `
         -ConfigProvider { param($RepoRootArg) $StopRaceConfig }.GetNewClosure() `
         -ProcessInspector $RaceInspector `
+        -ProcessEnumerator { , @() }.GetNewClosure() `
         -GracefulStopper { param($ProcessId) $RaceState.GracefulCalls += 1 }.GetNewClosure() `
         -ForceStopper { param($ProcessId) $RaceState.ForceCalls += 1 }.GetNewClosure() `
         -GracefulTimeoutMs 2000 -PollIntervalMs 100 `
@@ -539,6 +541,7 @@ try {
     $BothResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $StopBothPaths `
         -ConfigProvider { param($RepoRootArg) $StopBothConfig }.GetNewClosure() `
         -ProcessInspector $BothInspector `
+        -ProcessEnumerator { , @() }.GetNewClosure() `
         -GracefulStopper { param($ProcessId) $BothGracefulPids.Add($ProcessId); $BothMap.Remove($ProcessId) }.GetNewClosure() `
         -ForceStopper { param($ProcessId) throw "Force stop should not be needed in this test for PID $ProcessId" }.GetNewClosure() `
         -GracefulTimeoutMs 2000 -PollIntervalMs 100 `
@@ -548,6 +551,190 @@ try {
     Assert-True ($BothGracefulPids.Contains(5802)) 'The proxy PID must be among the graceful-stop targets.'
     Assert-True $BothResult.TunnelStopped 'Both must report the tunnel as stopped.'
     Assert-True $BothResult.ProxyStopped 'Both must report the proxy as stopped.'
+
+    Write-Host 'Checking Stop-LazyControlStack: a discovered tunnel-client.exe child of the supervisor is ALSO stopped (regression test for the orphaned-tunnel-client.exe bug)...'
+    # Bug: Stop-LazyControlStack used to verify and stop only the recorded supervisor PID.
+    # tunnel-client.exe is launched as a genuine OS CHILD of the supervisor and Windows does not
+    # cascade-kill children when a parent dies, so tunnel-client.exe was left running (still
+    # listening on its port) even though the script reported "Tunnel stopped: True". This test
+    # proves the fix: a fake ProcessEnumerator stands in for the supervisor's real child, and both
+    # PIDs must receive their own independent graceful-stop request.
+    $TreeDirectory = New-TrackedLazyTestDirectory
+    $TreeDestination = Join-Path $TreeDirectory 'rendered.yaml'
+    $TreeConfig = New-FakeRuntimeConfig -Directory $TreeDirectory -DestinationPath $TreeDestination
+    $TreePaths = New-FakeControlPaths $TreeDirectory
+    New-Item -ItemType Directory -Force -Path $TreePaths.BaseDirectory | Out-Null
+    Set-Content -LiteralPath $TreePaths.TunnelPidPath -Value '7101' -NoNewline
+    $TreeSupervisorInfo = [pscustomobject]@{ Id = 7101; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $TreeClientInfo = [pscustomobject]@{ Id = 7102; ParentId = 7101; ExecutablePath = $TreeConfig.TunnelClientPath; CommandLine = "`"$($TreeConfig.TunnelClientPath)`" run --profile dwb-serena" }
+    # A map of "currently alive" PIDs mutated by the fake GracefulStopper to simulate a real OS
+    # process actually exiting once asked - the poll loop's own recheck then naturally observes
+    # "gone" without needing a hand-computed call-count/time trace.
+    $TreeAlive = @{ 7101 = $TreeSupervisorInfo; 7102 = $TreeClientInfo }
+    $TreeInspector = { param($ProcessId) if ($TreeAlive.ContainsKey($ProcessId)) { $TreeAlive[$ProcessId] } else { $null } }.GetNewClosure()
+    $TreeEnumerator = { , @($TreeClientInfo) }.GetNewClosure()
+    $TreeGracefulPids = New-Object System.Collections.Generic.List[int]
+    $TreeGracefulStopper = { param($ProcessId) $TreeGracefulPids.Add($ProcessId); $TreeAlive.Remove($ProcessId) }.GetNewClosure()
+    $TreeForceStopper = { param($ProcessId) throw "Force stop should not be needed for PID $ProcessId in this test" }.GetNewClosure()
+    $TreeResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $TreePaths `
+        -ConfigProvider { param($RepoRootArg) $TreeConfig }.GetNewClosure() `
+        -ProcessInspector $TreeInspector -ProcessEnumerator $TreeEnumerator `
+        -GracefulStopper $TreeGracefulStopper -ForceStopper $TreeForceStopper `
+        -GracefulTimeoutMs 2000 -PollIntervalMs 100 `
+        -Sleeper { param($Milliseconds) } -NowProvider { Get-Date }
+    Assert-Equal 2 $TreeGracefulPids.Count 'Stopping the tunnel must send a graceful stop to BOTH the supervisor and its discovered tunnel-client.exe child.'
+    Assert-True ($TreeGracefulPids.Contains(7101)) 'The supervisor PID must receive a graceful stop request.'
+    Assert-True ($TreeGracefulPids.Contains(7102)) 'The discovered tunnel-client.exe child PID must receive its own graceful stop request - this is the exact orphaning bug: previously only the supervisor was ever touched.'
+    Assert-Equal 7101 $TreeGracefulPids[0] 'The supervisor must be stopped BEFORE the child, so its restart-supervision loop is halted first and cannot relaunch tunnel-client.exe after the child is killed.'
+    Assert-True $TreeResult.TunnelStopped 'TunnelStopped must be true once both the supervisor and its tunnel-client.exe child are confirmed gone.'
+    Assert-True (-not (Test-Path -LiteralPath $TreePaths.TunnelPidPath)) 'The tunnel PID file must be removed once the whole tree is confirmed stopped.'
+
+    Write-Host 'Checking Stop-LazyControlStack: a discovered tunnel-client.exe child that ignores graceful shutdown is force-killed...'
+    $TreeForceDirectory = New-TrackedLazyTestDirectory
+    $TreeForceDestination = Join-Path $TreeForceDirectory 'rendered.yaml'
+    $TreeForceConfig = New-FakeRuntimeConfig -Directory $TreeForceDirectory -DestinationPath $TreeForceDestination
+    $TreeForcePaths = New-FakeControlPaths $TreeForceDirectory
+    New-Item -ItemType Directory -Force -Path $TreeForcePaths.BaseDirectory | Out-Null
+    Set-Content -LiteralPath $TreeForcePaths.TunnelPidPath -Value '7301' -NoNewline
+    $TreeForceSupervisorInfo = [pscustomobject]@{ Id = 7301; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $TreeForceClientInfo = [pscustomobject]@{ Id = 7302; ParentId = 7301; ExecutablePath = $TreeForceConfig.TunnelClientPath; CommandLine = "`"$($TreeForceConfig.TunnelClientPath)`" run --profile dwb-serena" }
+    $TreeForceAlive = @{ 7301 = $TreeForceSupervisorInfo; 7302 = $TreeForceClientInfo }
+    # Only the supervisor "honors" the graceful stop; the child stubbornly stays in the alive map
+    # until force-killed - this exercises the child specifically going through the same
+    # graceful-then-force fallback already proven generically by the Proxy force-kill test above.
+    $TreeForceGracefulStopper = { param($ProcessId) if ($ProcessId -eq 7301) { $TreeForceAlive.Remove(7301) } }.GetNewClosure()
+    $TreeForceForceCalls = New-Object System.Collections.Generic.List[int]
+    $TreeForceForceStopper = { param($ProcessId) $TreeForceForceCalls.Add($ProcessId); $TreeForceAlive.Remove($ProcessId) }.GetNewClosure()
+    $TreeForceInspector = { param($ProcessId) if ($TreeForceAlive.ContainsKey($ProcessId)) { $TreeForceAlive[$ProcessId] } else { $null } }.GetNewClosure()
+    $TreeForceEnumerator = { , @($TreeForceClientInfo) }.GetNewClosure()
+    $TreeForceResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $TreeForcePaths `
+        -ConfigProvider { param($RepoRootArg) $TreeForceConfig }.GetNewClosure() `
+        -ProcessInspector $TreeForceInspector -ProcessEnumerator $TreeForceEnumerator `
+        -GracefulStopper $TreeForceGracefulStopper -ForceStopper $TreeForceForceStopper `
+        -GracefulTimeoutMs 300 -PollIntervalMs 50 `
+        -Sleeper { param($Milliseconds) Start-Sleep -Milliseconds $Milliseconds }.GetNewClosure() -NowProvider { Get-Date }.GetNewClosure()
+    Assert-Equal 1 $TreeForceForceCalls.Count 'Exactly one force-kill must be issued.'
+    Assert-Equal 7302 $TreeForceForceCalls[0] 'The force-kill must target the stubborn tunnel-client.exe child specifically, not the supervisor (which already stopped gracefully).'
+    Assert-True $TreeForceResult.TunnelStopped 'TunnelStopped must be true once the stubborn child is confirmed gone via force-kill.'
+
+    Write-Host 'Checking Stop-LazyControlStack: TunnelStopped is FALSE if the discovered child cannot be confirmed stopped, even though the supervisor stopped fine (must never report success while an orphan could remain)...'
+    # This is the precise symptom the live rollout hit: the script reported "Tunnel stopped: True"
+    # while tunnel-client.exe was still alive and listening. Here the supervisor genuinely stops,
+    # but the child's PID gets reused by an unrelated process exactly at the pre-force re-verify
+    # moment (the same safety gate already proven for a single target above) - the fix must refuse
+    # to force-kill it AND must not report the tunnel as successfully stopped.
+    $TreePartialDirectory = New-TrackedLazyTestDirectory
+    $TreePartialDestination = Join-Path $TreePartialDirectory 'rendered.yaml'
+    $TreePartialConfig = New-FakeRuntimeConfig -Directory $TreePartialDirectory -DestinationPath $TreePartialDestination
+    $TreePartialPaths = New-FakeControlPaths $TreePartialDirectory
+    New-Item -ItemType Directory -Force -Path $TreePartialPaths.BaseDirectory | Out-Null
+    Set-Content -LiteralPath $TreePartialPaths.TunnelPidPath -Value '7401' -NoNewline
+    $PartialSupervisorInfo = [pscustomobject]@{ Id = 7401; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $PartialClientInfo = [pscustomobject]@{ Id = 7402; ParentId = 7401; ExecutablePath = $TreePartialConfig.TunnelClientPath; CommandLine = "`"$($TreePartialConfig.TunnelClientPath)`" run --profile dwb-serena" }
+    $PartialReusedClientInfo = [pscustomobject]@{ Id = 7402; ExecutablePath = 'C:\Windows\System32\calc.exe'; CommandLine = 'calc.exe' }
+    # Trace (GracefulTimeoutMs=2000, PollIntervalMs=100), queue values are absolute offsets from Base:
+    #   Parent: NowProvider #1 (0ms) -> Deadline=2000ms; NowProvider #2 (100ms, <2000) -> loop body
+    #           -> inspector sees parent removed (GracefulStopper honored it) -> Stopped=true, break.
+    #   Child:  NowProvider #3 (5000ms) -> Deadline=7000ms
+    #           NowProvider #4 (5100ms, <7000) -> loop body -> inspector call #2 -> still matches
+    #           NowProvider #5 (5500ms, <7000) -> loop body -> inspector call #3 -> still matches
+    #           NowProvider #6 (7100ms, >=7000) -> loop exits WITHOUT another inspector call, Stopped still false
+    #           -> mandatory pre-force-kill re-verify -> inspector call #4 -> PID reused by calc.exe -> no force-kill.
+    $PartialTimeQueue = New-Object System.Collections.Generic.Queue[datetime]
+    $PartialBase = Get-Date '2026-08-21T09:00:00'
+    foreach ($OffsetMs in @(0, 100, 5000, 5100, 5500, 7100)) { $PartialTimeQueue.Enqueue($PartialBase.AddMilliseconds($OffsetMs)) }
+    $PartialNowProvider = { if ($PartialTimeQueue.Count -gt 0) { $PartialTimeQueue.Dequeue() } else { $PartialBase.AddMilliseconds(999999) } }.GetNewClosure()
+    $PartialAlive = @{ 7401 = $PartialSupervisorInfo }
+    $PartialChildCallCount = @{ Count = 0 }
+    $PartialInspector = {
+        param($ProcessId)
+        if ($ProcessId -eq 7401) { if ($PartialAlive.ContainsKey(7401)) { return $PartialAlive[7401] } else { return $null } }
+        if ($ProcessId -eq 7402) {
+            $PartialChildCallCount.Count += 1
+            if ($PartialChildCallCount.Count -le 3) { return $PartialClientInfo }
+            return $PartialReusedClientInfo
+        }
+        return $null
+    }.GetNewClosure()
+    $PartialEnumerator = { , @($PartialClientInfo) }.GetNewClosure()
+    $PartialForceCalls = New-Object System.Collections.Generic.List[int]
+    $PartialResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $TreePartialPaths `
+        -ConfigProvider { param($RepoRootArg) $TreePartialConfig }.GetNewClosure() `
+        -ProcessInspector $PartialInspector -ProcessEnumerator $PartialEnumerator `
+        -GracefulStopper { param($ProcessId) if ($ProcessId -eq 7401) { $PartialAlive.Remove(7401) } }.GetNewClosure() `
+        -ForceStopper { param($ProcessId) $PartialForceCalls.Add($ProcessId) }.GetNewClosure() `
+        -GracefulTimeoutMs 2000 -PollIntervalMs 100 `
+        -Sleeper { param($Milliseconds) } -NowProvider $PartialNowProvider
+    Assert-Equal 0 $PartialForceCalls.Count 'A child PID reused by an unrelated process at the pre-force re-verify moment must never be force-killed.'
+    Assert-True (-not $PartialResult.TunnelStopped) 'TunnelStopped must be FALSE when the child could not be confirmed stopped, even though the supervisor itself stopped cleanly - this is the exact bug: the script must never report "Tunnel stopped: True" while tunnel-client.exe could still be running.'
+    Assert-True (($PartialResult.SkippedStale | Where-Object { $_ -like '*tunnel-client.exe*' } | Measure-Object).Count -gt 0) 'A note about the unstoppable tunnel-client.exe child must be recorded for operator visibility.'
+
+    Write-Host 'Checking Stop-LazySupervisedProcessTree against REAL OS dummy processes (a real cmd.exe parent + a real cmd.exe child it actually spawns): both are genuinely terminated afterward...'
+    # The mock-based tests above prove the WIRING is correct (both PIDs receive stop requests,
+    # verification gates both, ordering is parent-then-child) but they cannot prove the underlying
+    # mechanism - enumerating a real process's real children via ParentProcessId, then stopping
+    # each with real taskkill.exe - actually works against genuine Windows parent/child processes.
+    # This test spawns real, short-lived, harmless dummy processes (cmd.exe running `timeout`,
+    # never the real tunnel-client.exe/serena binaries) and verifies success by directly querying
+    # real OS process state afterward, not by trusting a mocked stopper's return value.
+    $DummyCmdPath = (Get-Command cmd.exe).Source
+    $DummyMarker = 'lazyctl-dummy-' + [Guid]::NewGuid().ToString('N')
+    $DummyInnerCommand = "timeout /t 90 /nobreak >nul & rem $DummyMarker"
+    $DummyParentProcess = $null
+    $DummyRealChildPid = $null
+    try {
+        $DummyParentProcess = Start-Process -FilePath $DummyCmdPath -ArgumentList @('/c', "cmd.exe /c `"$DummyInnerCommand`"") -WindowStyle Hidden -PassThru
+        Assert-True ($null -ne $DummyParentProcess -and $DummyParentProcess.Id) 'Test setup: the real dummy parent process must actually launch.'
+
+        # Wait for the real child cmd.exe (spawned BY the parent's own command interpretation, not
+        # by this test) to actually appear - CreateProcess for the inner cmd.exe is not instantaneous.
+        $WaitDeadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $WaitDeadline -and -not $DummyRealChildPid) {
+            $RealCandidates = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.ParentProcessId -eq $DummyParentProcess.Id -and $_.CommandLine -and $_.CommandLine.Contains($DummyMarker)
+            }
+            if ($RealCandidates) { $DummyRealChildPid = ($RealCandidates | Select-Object -First 1).ProcessId }
+            else { Start-Sleep -Milliseconds 200 }
+        }
+        Assert-True ($null -ne $DummyRealChildPid) 'Test setup: the real dummy child cmd.exe must actually appear as a live child process before this test can proceed.'
+        Assert-True ($null -ne (Get-Process -Id $DummyParentProcess.Id -ErrorAction SilentlyContinue)) 'Test setup: the real dummy parent process must be alive before stopping it.'
+        Assert-True ($null -ne (Get-Process -Id $DummyRealChildPid -ErrorAction SilentlyContinue)) 'Test setup: the real dummy child process must be alive before stopping it.'
+
+        $RealProcessInspector = { param($ProcessId) Get-LazyProcessInfo -ProcessId $ProcessId }.GetNewClosure()
+        $RealProcessEnumerator = {
+            Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Id = $_.ProcessId; ParentId = $_.ParentProcessId; ExecutablePath = $_.ExecutablePath; CommandLine = $_.CommandLine }
+            }
+        }.GetNewClosure()
+        # Real taskkill-based stoppers - the actual production defaults, exercised for real against
+        # only these disposable dummy PIDs.
+        $RealGracefulStopper = { param($ProcessId) Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $ProcessId) -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null }.GetNewClosure()
+        $RealForceStopper = { param($ProcessId) Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $ProcessId, '/T', '/F') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null }.GetNewClosure()
+
+        $DummyTreeResult = Stop-LazySupervisedProcessTree -ParentProcessId $DummyParentProcess.Id `
+            -ParentExpectedExecutablePath $DummyCmdPath -ParentRequiredCommandLineSubstrings @($DummyMarker) `
+            -ChildExpectedExecutablePath $DummyCmdPath -ChildRequiredCommandLineSubstrings @($DummyMarker) `
+            -ProcessInspector $RealProcessInspector -ProcessEnumerator $RealProcessEnumerator `
+            -GracefulStopper $RealGracefulStopper -ForceStopper $RealForceStopper `
+            -GracefulTimeoutMs 3000 -PollIntervalMs 200 `
+            -Sleeper { param($Milliseconds) Start-Sleep -Milliseconds $Milliseconds }.GetNewClosure() `
+            -NowProvider { Get-Date }.GetNewClosure()
+
+        Assert-True $DummyTreeResult.ParentAttempted 'The real dummy parent must pass identity verification.'
+        Assert-True $DummyTreeResult.ParentStopped 'The real dummy parent process must be reported stopped.'
+        Assert-Equal $DummyRealChildPid $DummyTreeResult.ChildPid 'Stop-LazySupervisedProcessTree must discover the same real child PID this test independently confirmed via Win32_Process.'
+        Assert-True $DummyTreeResult.ChildStopped 'The real dummy child process must be reported stopped.'
+
+        Start-Sleep -Milliseconds 500  # let the OS finish tearing the processes down before querying
+        Assert-True ($null -eq (Get-Process -Id $DummyParentProcess.Id -ErrorAction SilentlyContinue)) 'REAL OS CHECK: the dummy parent process must actually no longer exist - not just report success.'
+        Assert-True ($null -eq (Get-Process -Id $DummyRealChildPid -ErrorAction SilentlyContinue)) 'REAL OS CHECK: the dummy child process must actually no longer exist - this is the exact orphaning bug being fixed, proven against a real OS parent/child pair.'
+    }
+    finally {
+        # Best-effort safety net, in case an assertion above threw before the dummy processes were
+        # actually stopped. Only ever targets this test's own throwaway dummy PIDs.
+        if ($DummyRealChildPid) { Stop-Process -Id $DummyRealChildPid -Force -ErrorAction SilentlyContinue }
+        if ($DummyParentProcess -and $DummyParentProcess.Id) { Stop-Process -Id $DummyParentProcess.Id -Force -ErrorAction SilentlyContinue }
+    }
 
     Write-Host 'Checking Uninstall-LazyControlStack removes only the named task...'
     $UninstallDirectory = New-TrackedLazyTestDirectory

@@ -269,17 +269,166 @@ function Format-LazyControlStatus {
     return ($Lines -join [Environment]::NewLine)
 }
 
+function Stop-LazyVerifiedTarget {
+    # The shared verify-then-stop sequence used for every individually-verified PID this script
+    # ever stops: identity-verify, send a graceful stop, poll for exit, and - only if it survives
+    # the graceful timeout - re-verify identity ONE MORE TIME immediately before force-killing (so
+    # a PID reused by an unrelated process in the interim is never force-killed). A PID that fails
+    # the initial identity check is never touched at all (Attempted = $false).
+    param(
+        [Parameter(Mandatory)] [int]$ProcessId,
+        [string]$ExpectedExecutablePath,
+        [string]$ExpectedExecutablePattern,
+        [string[]]$RequiredCommandLineSubstrings = @(),
+        # Optional: reuse an inspection the caller already performed (e.g. Stop-LazySupervisedProcessTree
+        # verifies the parent once to decide whether to even look for a child) instead of querying
+        # -ProcessInspector a second time for the exact same PID at the exact same moment.
+        $InitialProcessInfo,
+        [Parameter(Mandatory)] [scriptblock]$ProcessInspector,
+        [Parameter(Mandatory)] [scriptblock]$GracefulStopper,
+        [Parameter(Mandatory)] [scriptblock]$ForceStopper,
+        [int]$GracefulTimeoutMs = 5000,
+        [int]$PollIntervalMs = 250,
+        [Parameter(Mandatory)] [scriptblock]$Sleeper,
+        [Parameter(Mandatory)] [scriptblock]$NowProvider
+    )
+    $Info = if ($PSBoundParameters.ContainsKey('InitialProcessInfo')) { $InitialProcessInfo } else { & $ProcessInspector $ProcessId }
+    $Verified = Confirm-LazyProcessMatch -ProcessInfo $Info -ExpectedExecutablePath $ExpectedExecutablePath -ExpectedExecutablePattern $ExpectedExecutablePattern -RequiredCommandLineSubstrings $RequiredCommandLineSubstrings
+    if (-not $Verified) {
+        return [pscustomobject]@{ Attempted = $false; Stopped = $false }
+    }
+
+    & $GracefulStopper $ProcessId
+
+    $Stopped = $false
+    $Deadline = (& $NowProvider).AddMilliseconds($GracefulTimeoutMs)
+    while ((& $NowProvider) -lt $Deadline) {
+        $Recheck = & $ProcessInspector $ProcessId
+        $StillOurs = Confirm-LazyProcessMatch -ProcessInfo $Recheck -ExpectedExecutablePath $ExpectedExecutablePath -ExpectedExecutablePattern $ExpectedExecutablePattern -RequiredCommandLineSubstrings $RequiredCommandLineSubstrings
+        if (-not $StillOurs) { $Stopped = $true; break }
+        & $Sleeper $PollIntervalMs
+    }
+
+    if (-not $Stopped) {
+        # Re-verify immediately before force-killing: never force-kill on a stale/reused PID,
+        # even if it matched moments earlier during the polling loop.
+        $FinalCheck = & $ProcessInspector $ProcessId
+        $StillOursAtForceTime = Confirm-LazyProcessMatch -ProcessInfo $FinalCheck -ExpectedExecutablePath $ExpectedExecutablePath -ExpectedExecutablePattern $ExpectedExecutablePattern -RequiredCommandLineSubstrings $RequiredCommandLineSubstrings
+        if ($StillOursAtForceTime) {
+            & $ForceStopper $ProcessId
+            $Stopped = $true
+        }
+    }
+
+    return [pscustomobject]@{ Attempted = $true; Stopped = $Stopped }
+}
+
+function Stop-LazySupervisedProcessTree {
+    # Stops a supervisor-style parent process AND, if one is found, exactly one verified child
+    # process - discovered by enumerating the parent's LIVE children while the parent is still
+    # verified alive to be their parent, not re-derived afterward (Windows does not clear/reassign
+    # a child's recorded ParentProcessId when the parent dies, but discovering the child first and
+    # holding its own PID avoids ever having to trust a parent-PID lookup performed against a PID
+    # number that could, in principle, have been reused by something unrelated in the interim).
+    # The parent is stopped BEFORE the child so that any restart-supervision loop the parent runs
+    # is halted first - killing the child while the parent (and its restart loop) is still alive
+    # would just cause an immediate relaunch. Written generically (parameterized identities) so
+    # this exact mechanism can be exercised in tests against real, disposable dummy OS processes
+    # without hardcoding the real supervisor/tunnel-client.exe identities.
+    param(
+        [Parameter(Mandatory)] [int]$ParentProcessId,
+        [string]$ParentExpectedExecutablePath,
+        [string]$ParentExpectedExecutablePattern,
+        [string[]]$ParentRequiredCommandLineSubstrings = @(),
+        [Parameter(Mandatory)] [string]$ChildExpectedExecutablePath,
+        [string[]]$ChildRequiredCommandLineSubstrings = @(),
+        [Parameter(Mandatory)] [scriptblock]$ProcessInspector,
+        [Parameter(Mandatory)] [scriptblock]$ProcessEnumerator,
+        [Parameter(Mandatory)] [scriptblock]$GracefulStopper,
+        [Parameter(Mandatory)] [scriptblock]$ForceStopper,
+        [int]$GracefulTimeoutMs = 5000,
+        [int]$PollIntervalMs = 250,
+        [Parameter(Mandatory)] [scriptblock]$Sleeper,
+        [Parameter(Mandatory)] [scriptblock]$NowProvider
+    )
+    $ParentInfo = & $ProcessInspector $ParentProcessId
+    $ParentVerified = Confirm-LazyProcessMatch -ProcessInfo $ParentInfo -ExpectedExecutablePath $ParentExpectedExecutablePath -ExpectedExecutablePattern $ParentExpectedExecutablePattern -RequiredCommandLineSubstrings $ParentRequiredCommandLineSubstrings
+    if (-not $ParentVerified) {
+        return [pscustomobject]@{ ParentAttempted = $false; ParentStopped = $false; ChildPid = $null; ChildAttempted = $false; ChildStopped = $false }
+    }
+
+    $ChildPid = $null
+    $Candidates = & $ProcessEnumerator
+    $ChildMatch = $Candidates | Where-Object {
+        $_.ParentId -eq $ParentProcessId -and
+        (Confirm-LazyProcessMatch -ProcessInfo $_ -ExpectedExecutablePath $ChildExpectedExecutablePath -RequiredCommandLineSubstrings $ChildRequiredCommandLineSubstrings)
+    } | Select-Object -First 1
+    if ($ChildMatch) { $ChildPid = $ChildMatch.Id }
+
+    $ParentOutcome = Stop-LazyVerifiedTarget -ProcessId $ParentProcessId `
+        -ExpectedExecutablePath $ParentExpectedExecutablePath -ExpectedExecutablePattern $ParentExpectedExecutablePattern -RequiredCommandLineSubstrings $ParentRequiredCommandLineSubstrings `
+        -InitialProcessInfo $ParentInfo `
+        -ProcessInspector $ProcessInspector -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
+        -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
+
+    $ChildAttempted = $false
+    $ChildStopped = $false
+    if ($ChildPid) {
+        # The parent's own force-kill (above) uses taskkill /T, which recursively kills its
+        # descendant tree - so if the parent needed forcing, the child may already be gone as a
+        # side effect by the time we get here. Check first: a child that no longer exists at all
+        # is a successfully-reaped child, not a failed stop attempt (Stop-LazyVerifiedTarget's
+        # "Attempted = $false" is built for a PID that never matched our expected identity in the
+        # first place, e.g. a mismatched/reused PID, which must NOT be reported as success - a
+        # genuinely-vanished child must).
+        $ChildInfoNow = & $ProcessInspector $ChildPid
+        if (-not $ChildInfoNow) {
+            $ChildAttempted = $true
+            $ChildStopped = $true
+        }
+        else {
+            $ChildOutcome = Stop-LazyVerifiedTarget -ProcessId $ChildPid `
+                -ExpectedExecutablePath $ChildExpectedExecutablePath -RequiredCommandLineSubstrings $ChildRequiredCommandLineSubstrings `
+                -InitialProcessInfo $ChildInfoNow `
+                -ProcessInspector $ProcessInspector -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
+                -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
+            $ChildAttempted = $ChildOutcome.Attempted
+            $ChildStopped = $ChildOutcome.Stopped
+        }
+    }
+
+    return [pscustomobject]@{
+        ParentAttempted = $true
+        ParentStopped   = $ParentOutcome.Stopped
+        ChildPid        = $ChildPid
+        ChildAttempted  = $ChildAttempted
+        ChildStopped    = $ChildStopped
+    }
+}
+
 function Stop-LazyControlStack {
-    # Safety-critical: every stop attempt on every PID (tunnel and proxy) is independently
-    # verified - twice - against the exact executable path and command line this script itself
-    # would have launched, before any stop signal (graceful or forced) is ever sent. A PID file
-    # that is missing, unparsable, points at a process that no longer exists, or points at a
-    # process whose identity does not match is left completely untouched.
+    # Safety-critical: every stop attempt on every PID (tunnel supervisor, tunnel-client.exe, and
+    # proxy) is independently verified - twice - against the exact executable path and command
+    # line this script itself would have launched, before any stop signal (graceful or forced) is
+    # ever sent. A PID file that is missing, unparsable, points at a process that no longer exists,
+    # or points at a process whose identity does not match is left completely untouched.
+    #
+    # The "Tunnel" umbrella covers TWO independently-verified process identities, not one: the
+    # hidden PowerShell supervisor (recorded in dwb-serena-tunnel.pid) AND its tunnel-client.exe
+    # child (discovered live via ProcessEnumerator, never persisted to its own PID file - see
+    # Stop-LazySupervisedProcessTree). Windows does not cascade-kill a process's children when the
+    # parent is terminated, so stopping only the supervisor would silently orphan a still-listening
+    # tunnel-client.exe.
     param(
         [Parameter(Mandatory)] [string]$RepoRoot,
         [pscustomobject]$Paths,
         [scriptblock]$ConfigProvider = { param($RepoRootArg) Get-LazyRuntimeConfig -RepoRoot $RepoRootArg },
         [scriptblock]$ProcessInspector = { param($ProcessId) Get-LazyProcessInfo -ProcessId $ProcessId },
+        [scriptblock]$ProcessEnumerator = {
+            Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Id = $_.ProcessId; ParentId = $_.ParentProcessId; ExecutablePath = $_.ExecutablePath; CommandLine = $_.CommandLine }
+            }
+        },
         [scriptblock]$GracefulStopper = { param($ProcessId) Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $ProcessId) -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null },
         [scriptblock]$ForceStopper = { param($ProcessId) Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $ProcessId, '/T', '/F') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null },
         [int]$GracefulTimeoutMs = 5000,
@@ -298,61 +447,58 @@ function Stop-LazyControlStack {
         SkippedStale  = New-Object System.Collections.Generic.List[string]
     }
 
-    # The tunnel target matches on the resolved absolute powershell.exe path AND the resolved
-    # absolute lazy-supervisor.ps1 path for THIS repo checkout - not a bare 'lazy-supervisor.ps1'
-    # filename substring, which would also match a different checkout's identically-named
-    # supervisor script (this repo is a starter kit that is routinely checked out more than once
-    # per machine). A stale PID reused by another checkout's legitimate supervisor process must
-    # never be treated as "ours".
-    $Targets = @(
-        [pscustomobject]@{ Name = 'Tunnel'; PidPath = $Paths.TunnelPidPath; ExecutablePath = $PowerShellPath; ExecutablePattern = $null; Substrings = @($SupervisorPath) }
-        [pscustomobject]@{ Name = 'Proxy';  PidPath = $Paths.ProxyPidPath;  ExecutablePath = $Config.NodePath; ExecutablePattern = $null; Substrings = @('cli.mjs', $Config.ManifestPath) }
-    )
+    # --- Tunnel: supervisor + its tunnel-client.exe child ---
+    $SupervisorPid = Read-LazyPidFile -Path $Paths.TunnelPidPath
+    if (-not $SupervisorPid) {
+        $Result.SkippedStale.Add('Tunnel: no valid PID file found; nothing to stop.')
+    }
+    else {
+        $TreeResult = Stop-LazySupervisedProcessTree -ParentProcessId $SupervisorPid `
+            -ParentExpectedExecutablePath $PowerShellPath -ParentRequiredCommandLineSubstrings @($SupervisorPath) `
+            -ChildExpectedExecutablePath $Config.TunnelClientPath -ChildRequiredCommandLineSubstrings @('run --profile dwb-serena') `
+            -ProcessInspector $ProcessInspector -ProcessEnumerator $ProcessEnumerator `
+            -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
+            -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
 
-    foreach ($Target in $Targets) {
-        $ProcessId = Read-LazyPidFile -Path $Target.PidPath
-        if (-not $ProcessId) {
-            $Result.SkippedStale.Add("$($Target.Name): no valid PID file found; nothing to stop.")
-            continue
-        }
-
-        $Info = & $ProcessInspector $ProcessId
-        $Verified = Confirm-LazyProcessMatch -ProcessInfo $Info -ExpectedExecutablePath $Target.ExecutablePath -ExpectedExecutablePattern $Target.ExecutablePattern -RequiredCommandLineSubstrings $Target.Substrings
-        if (-not $Verified) {
-            $Result.SkippedStale.Add("$($Target.Name): PID $ProcessId did not match the expected managed process; left untouched.")
-            continue
-        }
-
-        & $GracefulStopper $ProcessId
-
-        $Stopped = $false
-        $Deadline = (& $NowProvider).AddMilliseconds($GracefulTimeoutMs)
-        while ((& $NowProvider) -lt $Deadline) {
-            $Recheck = & $ProcessInspector $ProcessId
-            $StillOurs = Confirm-LazyProcessMatch -ProcessInfo $Recheck -ExpectedExecutablePath $Target.ExecutablePath -ExpectedExecutablePattern $Target.ExecutablePattern -RequiredCommandLineSubstrings $Target.Substrings
-            if (-not $StillOurs) { $Stopped = $true; break }
-            & $Sleeper $PollIntervalMs
-        }
-
-        if (-not $Stopped) {
-            # Re-verify immediately before force-killing: never force-kill on a stale/reused PID,
-            # even if it matched moments earlier during the polling loop.
-            $FinalCheck = & $ProcessInspector $ProcessId
-            $StillOursAtForceTime = Confirm-LazyProcessMatch -ProcessInfo $FinalCheck -ExpectedExecutablePath $Target.ExecutablePath -ExpectedExecutablePattern $Target.ExecutablePattern -RequiredCommandLineSubstrings $Target.Substrings
-            if ($StillOursAtForceTime) {
-                & $ForceStopper $ProcessId
-                $Stopped = $true
-            }
-        }
-
-        if ($Target.Name -eq 'Tunnel') { $Result.TunnelStopped = $Stopped }
-        if ($Target.Name -eq 'Proxy') { $Result.ProxyStopped = $Stopped }
-
-        if ($Stopped) {
-            Remove-Item -LiteralPath $Target.PidPath -Force -ErrorAction SilentlyContinue
+        if (-not $TreeResult.ParentAttempted) {
+            $Result.SkippedStale.Add("Tunnel: PID $SupervisorPid did not match the expected supervisor process; left untouched.")
         }
         else {
-            $Result.SkippedStale.Add("$($Target.Name): PID $ProcessId could not be confirmed stopped; PID file left in place.")
+            $ChildOk = (-not $TreeResult.ChildPid) -or $TreeResult.ChildStopped
+            $Result.TunnelStopped = $TreeResult.ParentStopped -and $ChildOk
+
+            if ($TreeResult.ParentStopped) {
+                Remove-Item -LiteralPath $Paths.TunnelPidPath -Force -ErrorAction SilentlyContinue
+            }
+            else {
+                $Result.SkippedStale.Add("Tunnel: PID $SupervisorPid could not be confirmed stopped; PID file left in place.")
+            }
+
+            if ($TreeResult.ChildPid -and -not $TreeResult.ChildStopped) {
+                $Result.SkippedStale.Add("Tunnel: tunnel-client.exe (PID $($TreeResult.ChildPid)) could not be confirmed stopped.")
+            }
+        }
+    }
+
+    # --- Proxy ---
+    $ProxyPid = Read-LazyPidFile -Path $Paths.ProxyPidPath
+    if (-not $ProxyPid) {
+        $Result.SkippedStale.Add('Proxy: no valid PID file found; nothing to stop.')
+    }
+    else {
+        $ProxyOutcome = Stop-LazyVerifiedTarget -ProcessId $ProxyPid `
+            -ExpectedExecutablePath $Config.NodePath -RequiredCommandLineSubstrings @('cli.mjs', $Config.ManifestPath) `
+            -ProcessInspector $ProcessInspector -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
+            -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
+        if (-not $ProxyOutcome.Attempted) {
+            $Result.SkippedStale.Add("Proxy: PID $ProxyPid did not match the expected managed process; left untouched.")
+        }
+        elseif ($ProxyOutcome.Stopped) {
+            $Result.ProxyStopped = $true
+            Remove-Item -LiteralPath $Paths.ProxyPidPath -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            $Result.SkippedStale.Add("Proxy: PID $ProxyPid could not be confirmed stopped; PID file left in place.")
         }
     }
 
@@ -368,6 +514,11 @@ function Uninstall-LazyControlStack {
         [scriptblock]$TaskExistenceChecker = { param($TaskNameArg) [bool](Get-ScheduledTask -TaskName $TaskNameArg -ErrorAction SilentlyContinue) },
         [scriptblock]$TaskRemover = { param($TaskNameArg) Unregister-ScheduledTask -TaskName $TaskNameArg -Confirm:$false },
         [scriptblock]$ProcessInspector = { param($ProcessId) Get-LazyProcessInfo -ProcessId $ProcessId },
+        [scriptblock]$ProcessEnumerator = {
+            Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Id = $_.ProcessId; ParentId = $_.ParentProcessId; ExecutablePath = $_.ExecutablePath; CommandLine = $_.CommandLine }
+            }
+        },
         [scriptblock]$GracefulStopper = { param($ProcessId) Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $ProcessId) -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null },
         [scriptblock]$ForceStopper = { param($ProcessId) Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $ProcessId, '/T', '/F') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null },
         [int]$GracefulTimeoutMs = 5000,
@@ -384,7 +535,7 @@ function Uninstall-LazyControlStack {
     }
 
     $StopResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $Paths -ConfigProvider $ConfigProvider `
-        -ProcessInspector $ProcessInspector -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
+        -ProcessInspector $ProcessInspector -ProcessEnumerator $ProcessEnumerator -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
         -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
 
     $RestoredFrom = $null
