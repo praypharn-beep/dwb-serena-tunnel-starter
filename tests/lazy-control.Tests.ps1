@@ -5,6 +5,11 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 $FakeTunnelId = 'tunnel_0123456789abcdef0123456789abcdef'
 $FakeSupervisorPath = Join-Path $RepoRoot 'scripts\lazy-supervisor.ps1'
+# Resolved the same way scripts\lazy-control.ps1 itself resolves it, so fake ProcessInfo fixtures
+# used against Get-LazyControlStatus/Stop-LazyControlStack (which compare -ExpectedExecutablePath
+# against the real (Get-Command powershell.exe).Source at runtime) match on the exact live value
+# rather than a guessed literal.
+$RealPowerShellPath = (Get-Command powershell.exe).Source
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
@@ -278,7 +283,7 @@ try {
     New-Item -ItemType Directory -Force -Path $StatusPaths.BaseDirectory | Out-Null
     Set-Content -LiteralPath $StatusPaths.TunnelPidPath -Value '7001' -NoNewline
     Set-Content -LiteralPath $StatusPaths.ProxyPidPath -Value '7002' -NoNewline
-    $TunnelInfo = [pscustomobject]@{ Id = 7001; ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $TunnelInfo = [pscustomobject]@{ Id = 7001; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
     $ProxyInfo = [pscustomobject]@{ Id = 7002; ExecutablePath = $StatusConfig.NodePath; CommandLine = $StatusConfig.ProxyCommand }
     $InspectorMap = @{ 7001 = $TunnelInfo; 7002 = $ProxyInfo }
     $FakeInspector = { param($ProcessId) if ($InspectorMap.ContainsKey($ProcessId)) { $InspectorMap[$ProcessId] } else { $null } }.GetNewClosure()
@@ -382,6 +387,46 @@ try {
     Assert-True ($WrongResult.SkippedStale.Count -ge 1) 'A mismatched PID must be recorded as skipped for operator visibility.'
     Assert-True (Test-Path -LiteralPath $StopWrongPaths.TunnelPidPath) 'A mismatched/stale PID file must be left in place, not silently deleted.'
 
+    Write-Host 'Checking Stop-LazyControlStack: a stale PID reused by ANOTHER CHECKOUTs legitimate lazy-supervisor.ps1 process is never stopped (cross-checkout safety)...'
+    # This repo is a starter kit that is routinely checked out more than once on the same machine.
+    # Two checkouts both have a script literally named 'scripts\lazy-supervisor.ps1' and both run
+    # it via 'powershell.exe'. A PID-verification check that only looked for the bare filename
+    # 'lazy-supervisor.ps1' as a command-line substring (and a loose '*powershell*' executable
+    # pattern) would incorrectly treat another checkout's genuinely-running supervisor as "ours"
+    # if our own stale PID number happened to get reused by it. The check must key off the full,
+    # absolute, checkout-specific supervisor path instead.
+    $CrossCheckoutDirectory = New-TrackedLazyTestDirectory
+    $CrossCheckoutDestination = Join-Path $CrossCheckoutDirectory 'rendered.yaml'
+    $CrossCheckoutConfig = New-FakeRuntimeConfig -Directory $CrossCheckoutDirectory -DestinationPath $CrossCheckoutDestination
+    $CrossCheckoutPaths = New-FakeControlPaths $CrossCheckoutDirectory
+    New-Item -ItemType Directory -Force -Path $CrossCheckoutPaths.BaseDirectory | Out-Null
+    Set-Content -LiteralPath $CrossCheckoutPaths.TunnelPidPath -Value '6101' -NoNewline
+    $OtherCheckoutSupervisorPath = Join-Path (Join-Path $RepoRoot '..\some-other-checkout') 'scripts\lazy-supervisor.ps1'
+    # Same real powershell.exe, same bare filename 'lazy-supervisor.ps1' - only the absolute path differs.
+    $OtherCheckoutProcess = [pscustomobject]@{ Id = 6101; ExecutablePath = $RealPowerShellPath; CommandLine = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$OtherCheckoutSupervisorPath`"" }
+    Assert-True ($OtherCheckoutProcess.CommandLine.Contains('lazy-supervisor.ps1')) 'Test setup sanity: the other checkout process must still contain the bare filename substring - this is exactly the shape a loose check would have wrongly accepted.'
+    Assert-True (-not $OtherCheckoutProcess.CommandLine.Contains($FakeSupervisorPath)) 'Test setup sanity: the other checkout process must NOT contain THIS checkout''s absolute supervisor path.'
+    $CrossCheckoutStopCalls = @{ Graceful = 0; Force = 0 }
+    $CrossCheckoutResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $CrossCheckoutPaths `
+        -ConfigProvider { param($RepoRootArg) $CrossCheckoutConfig }.GetNewClosure() `
+        -ProcessInspector { param($ProcessId) $OtherCheckoutProcess }.GetNewClosure() `
+        -GracefulStopper { param($ProcessId) $CrossCheckoutStopCalls.Graceful += 1 }.GetNewClosure() `
+        -ForceStopper { param($ProcessId) $CrossCheckoutStopCalls.Force += 1 }.GetNewClosure() `
+        -Sleeper { param($Milliseconds) } -NowProvider { Get-Date }
+    Assert-Equal 0 $CrossCheckoutStopCalls.Graceful 'A PID reused by a DIFFERENT checkouts genuinely-running lazy-supervisor.ps1 must never receive a graceful stop signal - only an exact absolute-path match for THIS checkout counts as ours.'
+    Assert-Equal 0 $CrossCheckoutStopCalls.Force 'A PID reused by a DIFFERENT checkouts genuinely-running lazy-supervisor.ps1 must never be force-killed.'
+    Assert-True (-not $CrossCheckoutResult.TunnelStopped) 'Stop-LazyControlStack must not report success against another checkouts process.'
+    Assert-True (Test-Path -LiteralPath $CrossCheckoutPaths.TunnelPidPath) 'The stale cross-checkout PID file must be left in place, not silently deleted.'
+
+    Write-Host 'Checking Get-LazyControlStatus: a PID reused by another checkouts supervisor is reported as NOT verified (cross-checkout safety)...'
+    # (No proxy PID file was ever written for this fixture; Read-LazyPidFile naturally reads that as null.)
+    $CrossCheckoutStatusResult = Get-LazyControlStatus -RepoRoot $RepoRoot -Paths $CrossCheckoutPaths `
+        -ConfigProvider { param($RepoRootArg) $CrossCheckoutConfig }.GetNewClosure() `
+        -ProcessInspector { param($ProcessId) $OtherCheckoutProcess }.GetNewClosure() `
+        -StatusHttpGetter { param($Url) throw 'connection refused' }.GetNewClosure()
+    Assert-Equal 6101 $CrossCheckoutStatusResult.TunnelPid 'Status must still report the raw PID from the PID file.'
+    Assert-True (-not $CrossCheckoutStatusResult.TunnelVerified) 'Status must report a PID reused by another checkouts supervisor as NOT verified, even though it is a genuine powershell.exe running the same-named script.'
+
     Write-Host 'Checking Stop-LazyControlStack: a verified process that exits gracefully is not force-killed...'
     $StopGracefulDirectory = New-TrackedLazyTestDirectory
     $StopGracefulDestination = Join-Path $StopGracefulDirectory 'rendered.yaml'
@@ -389,7 +434,7 @@ try {
     $StopGracefulPaths = New-FakeControlPaths $StopGracefulDirectory
     New-Item -ItemType Directory -Force -Path $StopGracefulPaths.BaseDirectory | Out-Null
     Set-Content -LiteralPath $StopGracefulPaths.TunnelPidPath -Value '5501' -NoNewline
-    $GracefulRealInfo = [pscustomobject]@{ Id = 5501; ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $GracefulRealInfo = [pscustomobject]@{ Id = 5501; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
     $GracefulState = @{ GracefulCalls = 0; ForceCalls = 0; InspectCalls = 0 }
     $GracefulInspector = {
         param($ProcessId)
@@ -443,7 +488,7 @@ try {
     $StopRacePaths = New-FakeControlPaths $StopRaceDirectory
     New-Item -ItemType Directory -Force -Path $StopRacePaths.BaseDirectory | Out-Null
     Set-Content -LiteralPath $StopRacePaths.TunnelPidPath -Value '5701' -NoNewline
-    $OriginalTunnelInfo = [pscustomobject]@{ Id = 5701; ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $OriginalTunnelInfo = [pscustomobject]@{ Id = 5701; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
     $ReusedUnrelatedInfo = [pscustomobject]@{ Id = 5701; ExecutablePath = 'C:\Windows\System32\calc.exe'; CommandLine = 'calc.exe' }
     # Trace of NowProvider/ProcessInspector calls (GracefulTimeoutMs=2000, PollIntervalMs=100):
     #   inspector call #1 = initial verify (before graceful send)                -> OriginalTunnelInfo (match)
@@ -486,7 +531,7 @@ try {
     New-Item -ItemType Directory -Force -Path $StopBothPaths.BaseDirectory | Out-Null
     Set-Content -LiteralPath $StopBothPaths.TunnelPidPath -Value '5801' -NoNewline
     Set-Content -LiteralPath $StopBothPaths.ProxyPidPath -Value '5802' -NoNewline
-    $BothTunnelInfo = [pscustomobject]@{ Id = 5801; ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $BothTunnelInfo = [pscustomobject]@{ Id = 5801; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
     $BothProxyInfo = [pscustomobject]@{ Id = 5802; ExecutablePath = $StopBothConfig.NodePath; CommandLine = $StopBothConfig.ProxyCommand }
     $BothMap = @{ 5801 = $BothTunnelInfo; 5802 = $BothProxyInfo }
     $BothInspector = { param($ProcessId) if ($BothMap.ContainsKey($ProcessId)) { $BothMap[$ProcessId] } else { $null } }.GetNewClosure()

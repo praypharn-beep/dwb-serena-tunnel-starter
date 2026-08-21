@@ -22,6 +22,16 @@ function Get-LazyControlPaths {
     }
 }
 
+function Get-LazySupervisorPath {
+    # Single source of truth for the exact, absolute lazy-supervisor.ps1 path this repo checkout
+    # would launch. Every place that either launches the supervisor (Install-/Start-LazyControlStack)
+    # or verifies a candidate tunnel PID against it (Stop-LazyControlStack, Get-LazyControlStatus,
+    # Uninstall-LazyControlStack) must call this instead of recomputing the join inline, so a stop/
+    # status check can never drift from what was actually launched.
+    param([Parameter(Mandatory)] [string]$RepoRoot)
+    return Join-Path $RepoRoot 'scripts\lazy-supervisor.ps1'
+}
+
 function Read-LazyPidFile {
     param([Parameter(Mandatory)] [string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
@@ -109,7 +119,7 @@ function Install-LazyControlStack {
 
     Write-LazyTunnelProfile -TemplatePath $Config.ProfileTemplatePath -DestinationPath $Config.ProfileDestinationPath -TunnelId $Config.TunnelId -ProxyCommand $Config.ProxyCommand | Out-Null
 
-    $SupervisorPath = Join-Path $RepoRoot 'scripts\lazy-supervisor.ps1'
+    $SupervisorPath = Get-LazySupervisorPath -RepoRoot $RepoRoot
     $PowerShellPath = (Get-Command powershell.exe).Source
     $Argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SupervisorPath`""
     $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -149,7 +159,7 @@ function Start-LazyControlStack {
     $Config = & $ConfigProvider $RepoRoot
     if (-not $DiscoveryTimeoutMs) { $DiscoveryTimeoutMs = $Config.StartupTimeoutMs }
 
-    $SupervisorPath = Join-Path $RepoRoot 'scripts\lazy-supervisor.ps1'
+    $SupervisorPath = Get-LazySupervisorPath -RepoRoot $RepoRoot
     $PowerShellPath = (Get-Command powershell.exe).Source
     $ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $SupervisorPath)
 
@@ -195,12 +205,18 @@ function Get-LazyControlStatus {
     )
     if (-not $Paths) { $Paths = Get-LazyControlPaths }
     $Config = & $ConfigProvider $RepoRoot
+    $SupervisorPath = Get-LazySupervisorPath -RepoRoot $RepoRoot
+    $PowerShellPath = (Get-Command powershell.exe).Source
 
     $TunnelPid = Read-LazyPidFile -Path $Paths.TunnelPidPath
     $TunnelVerified = $false
     if ($TunnelPid) {
         $TunnelInfo = & $ProcessInspector $TunnelPid
-        $TunnelVerified = Confirm-LazyProcessMatch -ProcessInfo $TunnelInfo -ExpectedExecutablePattern '*powershell*' -RequiredCommandLineSubstrings @('lazy-supervisor.ps1')
+        # Match on the resolved absolute powershell.exe path AND the resolved absolute
+        # lazy-supervisor.ps1 path for THIS repo checkout - a bare filename substring like
+        # 'lazy-supervisor.ps1' would also match a different checkout's supervisor script of the
+        # same name, which is exactly the unrelated-process risk this check exists to prevent.
+        $TunnelVerified = Confirm-LazyProcessMatch -ProcessInfo $TunnelInfo -ExpectedExecutablePath $PowerShellPath -RequiredCommandLineSubstrings @($SupervisorPath)
     }
 
     $ProxyPid = Read-LazyPidFile -Path $Paths.ProxyPidPath
@@ -273,6 +289,8 @@ function Stop-LazyControlStack {
     )
     if (-not $Paths) { $Paths = Get-LazyControlPaths }
     $Config = & $ConfigProvider $RepoRoot
+    $SupervisorPath = Get-LazySupervisorPath -RepoRoot $RepoRoot
+    $PowerShellPath = (Get-Command powershell.exe).Source
 
     $Result = [pscustomobject]@{
         TunnelStopped = $false
@@ -280,8 +298,14 @@ function Stop-LazyControlStack {
         SkippedStale  = New-Object System.Collections.Generic.List[string]
     }
 
+    # The tunnel target matches on the resolved absolute powershell.exe path AND the resolved
+    # absolute lazy-supervisor.ps1 path for THIS repo checkout - not a bare 'lazy-supervisor.ps1'
+    # filename substring, which would also match a different checkout's identically-named
+    # supervisor script (this repo is a starter kit that is routinely checked out more than once
+    # per machine). A stale PID reused by another checkout's legitimate supervisor process must
+    # never be treated as "ours".
     $Targets = @(
-        [pscustomobject]@{ Name = 'Tunnel'; PidPath = $Paths.TunnelPidPath; ExecutablePath = $null; ExecutablePattern = '*powershell*'; Substrings = @('lazy-supervisor.ps1') }
+        [pscustomobject]@{ Name = 'Tunnel'; PidPath = $Paths.TunnelPidPath; ExecutablePath = $PowerShellPath; ExecutablePattern = $null; Substrings = @($SupervisorPath) }
         [pscustomobject]@{ Name = 'Proxy';  PidPath = $Paths.ProxyPidPath;  ExecutablePath = $Config.NodePath; ExecutablePattern = $null; Substrings = @('cli.mjs', $Config.ManifestPath) }
     )
 
