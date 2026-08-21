@@ -5,6 +5,8 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test lazy-proxy/test/*.test.mjs",
-    "test:proxy": "node --test lazy-proxy/test/proxy.integration.test.mjs"
+    "test:proxy": "node --test lazy-proxy/test/proxy.integration.test.mjs",
+    "test:launcher": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/lazy-launcher.Tests.ps1",
+    "test:validate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/validate.ps1"
   }
 }

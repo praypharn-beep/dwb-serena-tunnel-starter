@@ -13,4 +13,4 @@ log:
 mcp:
   commands:
     - channel: main
-      command: serena start-mcp-server --context chatgpt
+      command: '__LAZY_PROXY_COMMAND__'

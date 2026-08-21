@@ -9,7 +9,7 @@ function Assert-True([bool]$Condition, [string]$Message) {
 }
 
 Write-Host 'Checking PowerShell syntax...'
-$ScriptFiles = @('setup.ps1', 'configure.ps1', 'start.ps1')
+$ScriptFiles = @('setup.ps1', 'configure.ps1', 'start.ps1', 'scripts\lazy-common.ps1', 'scripts\lazy-supervisor.ps1')
 foreach ($ScriptFile in $ScriptFiles) {
     $Path = Join-Path $RepoRoot $ScriptFile
     $Tokens = $null
@@ -34,6 +34,74 @@ $ProfileContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'profiles\s
 Assert-True ($ProfileContent.Contains('tunnel_id: "__TUNNEL_ID__"')) 'The public profile must contain the Tunnel ID placeholder.'
 Assert-True ($ProfileContent.Contains('api_key: "env:CONTROL_PLANE_API_KEY"')) 'The public profile must read the API key from the environment.'
 Assert-True ($ProfileContent.Contains('listen_addr: 127.0.0.1:18010')) 'The health listener must remain loopback-only.'
+Assert-True ($ProfileContent.Contains("command: '__LAZY_PROXY_COMMAND__'")) 'The public profile must invoke the lazy proxy through its command placeholder, wrapped in YAML single quotes so a quoted executable path cannot corrupt the scalar.'
+Assert-True (-not $ProfileContent.Contains('serena start-mcp-server')) 'The public profile must not launch Serena directly; the lazy proxy owns that.'
+
+Write-Host 'Checking the Node.js runtime version...'
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $NodeVersionOutput = (& node --version 2>&1 | Out-String).Trim()
+    $NodeVersionExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+}
+Assert-True ($NodeVersionExitCode -eq 0) 'node --version must succeed; Node.js must be installed and on PATH.'
+$NodeVersionMatch = [regex]::Match($NodeVersionOutput, 'v(\d+)\.')
+Assert-True $NodeVersionMatch.Success "Unable to parse a Node.js version from: $NodeVersionOutput"
+Assert-True ([int]$NodeVersionMatch.Groups[1].Value -ge 20) "Node.js 20 or newer is required; found $NodeVersionOutput."
+
+Write-Host 'Checking required lazy proxy files...'
+$RequiredLazyFiles = @(
+    'lazy-proxy\protocol.mjs',
+    'lazy-proxy\manifest.mjs',
+    'lazy-proxy\serena-process.mjs',
+    'lazy-proxy\server.mjs',
+    'lazy-proxy\status-server.mjs',
+    'lazy-proxy\cli.mjs',
+    'lazy-proxy\serena-tools.json',
+    'lazy-proxy\scripts\capture-manifest.mjs',
+    'scripts\lazy-common.ps1',
+    'scripts\lazy-supervisor.ps1'
+)
+foreach ($RequiredFile in $RequiredLazyFiles) {
+    Assert-True (Test-Path -LiteralPath (Join-Path $RepoRoot $RequiredFile)) "Required lazy proxy file is missing: $RequiredFile"
+}
+
+Write-Host 'Checking loopback health and status addresses...'
+$CliContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'lazy-proxy\cli.mjs')
+Assert-True ($CliContent.Contains("statusAddress: '127.0.0.1:18012'")) 'The lazy proxy status address must default to 127.0.0.1:18012.'
+$LazyCommonContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'scripts\lazy-common.ps1')
+Assert-True ($LazyCommonContent.Contains("StatusAddress    = '127.0.0.1:18012'")) 'The launcher must render the same loopback-only status address.'
+
+Write-Host 'Checking for forbidden secret patterns in tracked files...'
+Push-Location $RepoRoot
+try {
+    $TrackedFiles = @(& git ls-files)
+    $ForbiddenSecretPattern = '(?i)(-----BEGIN [A-Z ]*PRIVATE KEY-----|\bsk-[A-Za-z0-9]{16,}\b|\bAKIA[0-9A-Z]{16}\b|^01000000[0-9a-f]{16,}$)'
+    $FilesWithSecrets = New-Object System.Collections.Generic.List[string]
+    foreach ($TrackedFile in $TrackedFiles) {
+        $FullPath = Join-Path $RepoRoot $TrackedFile
+        if (-not (Test-Path -LiteralPath $FullPath -PathType Leaf)) { continue }
+        $Bytes = [System.IO.File]::ReadAllBytes($FullPath)
+        if ($Bytes.Length -eq 0) { continue }
+        $IsBinary = $false
+        $SampleLength = [Math]::Min(8000, $Bytes.Length)
+        for ($Index = 0; $Index -lt $SampleLength; $Index++) {
+            if ($Bytes[$Index] -eq 0) { $IsBinary = $true; break }
+        }
+        if ($IsBinary) { continue }
+        $FileContent = Get-Content -Raw -LiteralPath $FullPath
+        if ($FileContent -match $ForbiddenSecretPattern) {
+            $FilesWithSecrets.Add($TrackedFile)
+        }
+    }
+    Assert-True ($FilesWithSecrets.Count -eq 0) "Forbidden secret-like patterns found in tracked files: $($FilesWithSecrets -join ', ')"
+}
+finally {
+    Pop-Location
+}
 
 Write-Host 'Checking ignored local files...'
 Push-Location $RepoRoot

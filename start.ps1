@@ -51,27 +51,21 @@ if ([string]::IsNullOrWhiteSpace($TunnelId) -or $TunnelId -cnotmatch '^tunnel_[0
     Fail 'Tunnel ID is missing or invalid. Run Configure.cmd again.'
 }
 
+. (Join-Path $Root 'scripts\lazy-common.ps1')
+
 try {
-    $EncryptedKey = (Get-Content -Raw -Path $SecretPath).Trim()
-    $SecureKey = ConvertTo-SecureString $EncryptedKey
-    $ControlPlaneApiKey = [System.Net.NetworkCredential]::new('', $SecureKey).Password
+    $Config = Get-LazyRuntimeConfig -RepoRoot $Root -TunnelIdOverride $TunnelId
 }
 catch {
-    Fail 'Could not decrypt the API key. Run Configure.cmd again under the same Windows user.'
+    Fail "Lazy proxy is not ready: $($_.Exception.Message)"
 }
 
-if ([string]::IsNullOrWhiteSpace($ControlPlaneApiKey)) {
-    Fail 'Decrypted API key is empty. Run Configure.cmd again.'
+try {
+    Write-LazyTunnelProfile -TemplatePath $Config.ProfileTemplatePath -DestinationPath $Config.ProfileDestinationPath -TunnelId $Config.TunnelId -ProxyCommand $Config.ProxyCommand | Out-Null
 }
-
-$env:CONTROL_PLANE_API_KEY = $ControlPlaneApiKey
-
-$ConfigDir = Split-Path -Parent $ProfilePath
-New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-
-$Content = Get-Content -Raw -Path $ProfileTemplate
-$Content = $Content.Replace('__TUNNEL_ID__', $TunnelId)
-Set-Content -Path $ProfilePath -Value $Content -Encoding utf8
+catch {
+    Fail "Could not render the tunnel profile: $($_.Exception.Message)"
+}
 
 $InstalledVersionPath = Join-Path $Root 'tunnel-client\.installed-version'
 $InstalledVersion = if (Test-Path $InstalledVersionPath) { (Get-Content -Raw $InstalledVersionPath).Trim() } else { 'unknown' }
@@ -84,30 +78,40 @@ Write-Host "Profile : $ProfileName"
 Write-Host "Tunnel  : $TunnelId"
 Write-Host "Client  : $InstalledVersion"
 Write-Host "Serena  : $($Serena.Source) ($($SerenaVersion -join ' '))"
-Write-Host 'Context : built-in chatgpt'
+Write-Host 'Context : built-in chatgpt (starts on first tool call, stops after 15 idle minutes)'
 Write-Host 'Health  : http://127.0.0.1:18010/ui'
+Write-Host "Status  : http://$($Config.StatusAddress)/status"
 Write-Host 'API key : decrypted locally with Windows DPAPI'
 Write-Host ''
 Write-Host 'Keep this window open while using ChatGPT.' -ForegroundColor Yellow
 Write-Host ''
 
 Write-Host 'Running tunnel-client preflight checks...' -ForegroundColor Cyan
-& $Client doctor --profile $ProfileName --explain
-if ($LASTEXITCODE -ne 0) {
+try {
+    $PreflightApiKey = Get-DpapiApiKey -SecretPath $Config.DpapiSecretPath
+}
+catch {
+    Fail "Could not decrypt the API key for preflight: $($_.Exception.Message)"
+}
+$env:CONTROL_PLANE_API_KEY = $PreflightApiKey
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $DoctorOutput = & $Client doctor --profile $ProfileName --explain 2>&1
+    $DoctorExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+    $PreflightApiKey = $null
+    $env:CONTROL_PLANE_API_KEY = $null
+}
+Write-Host ($DoctorOutput -join "`n")
+if ($DoctorExitCode -ne 0) {
     Fail 'Tunnel preflight failed. Review the diagnostics above, then run Start.cmd again.'
 }
 Write-Host 'Preflight : passed' -ForegroundColor Green
 Write-Host ''
 
-Push-Location (Split-Path -Parent $Client)
-try {
-    & $Client run --profile $ProfileName
-    if ($LASTEXITCODE -ne 0) {
-        Fail "Tunnel client exited with code $LASTEXITCODE."
-    }
-}
-finally {
-    $env:CONTROL_PLANE_API_KEY = $null
-    $ControlPlaneApiKey = $null
-    Pop-Location
-}
+$SupervisorScript = Join-Path $Root 'scripts\lazy-supervisor.ps1'
+& $SupervisorScript -Once
+exit $LASTEXITCODE
