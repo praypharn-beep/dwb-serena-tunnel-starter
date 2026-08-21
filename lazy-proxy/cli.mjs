@@ -20,8 +20,8 @@ function positiveInteger(value, name, fallback) {
 }
 
 function parseStatusAddress(value) {
-  const match = /^(127\.0\.0\.1|::1):(\d{1,5})$/.exec(value);
-  if (!match) fail('LAZY_SERENA_STATUS_ADDR must be a loopback host and port');
+  const match = /^(127\.0\.0\.1):(\d{1,5})$/.exec(value);
+  if (!match) fail('LAZY_SERENA_STATUS_ADDR must be 127.0.0.1 and a port');
   const port = Number(match[2]);
   if (port > 65535) fail('LAZY_SERENA_STATUS_ADDR port is out of range');
   return { host: match[1], port };
@@ -56,6 +56,10 @@ async function main() {
   const maxQueuedCalls = positiveInteger(process.env.LAZY_SERENA_MAX_QUEUE, 'LAZY_SERENA_MAX_QUEUE', PRODUCTION_DEFAULTS.maxQueuedCalls);
   const statusAddress = parseStatusAddress(options['--status'] ?? process.env.LAZY_SERENA_STATUS_ADDR ?? PRODUCTION_DEFAULTS.statusAddress);
   const manifest = await loadManifest(manifestPath);
+  // This injection is unavailable outside the Node test environment.
+  const testTaskkillImpl = process.env.NODE_ENV === 'test' && process.env.LAZY_SERENA_TEST_TASKKILL_FAIL === '1'
+    ? async () => { throw new Error('Injected taskkill failure'); }
+    : undefined;
   const manager = new SerenaProcessManager({
     command: options['--command'] ?? PRODUCTION_SERENA_COMMAND.command,
     args: commandArgs(options['--command-args']),
@@ -64,6 +68,7 @@ async function main() {
     idleTimeoutMs,
     shutdownGraceMs: 5_000,
     maxQueuedCalls,
+    ...(testTaskkillImpl ? { taskkillImpl: testTaskkillImpl } : {}),
   });
   let requestStop = () => {};
   const proxy = createProxyServer({

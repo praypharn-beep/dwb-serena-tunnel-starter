@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,7 +32,7 @@ async function eventually(predicate, message = 'condition was not met') {
   }
 }
 
-async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultCommand = false } = {}) {
+async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultCommand = false, taskkillFails = false, holdChildAfterStdin = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'lazy-proxy-'));
   const manifestPath = join(directory, 'manifest.json');
   const markerPath = join(directory, 'spawn-marker.txt');
@@ -46,16 +46,20 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
   }));
   await writeFile(wrapperPath, [
     "import { appendFileSync, writeFileSync } from 'node:fs';",
-    "appendFileSync(process.env.SPAWN_MARKER, `${process.pid}:${process.argv.slice(2).join('|')}\\n`);",
+    "appendFileSync(process.env.SPAWN_MARKER, `${process.pid}:${process.argv.slice(1).join('|')}\\n`);",
     "process.on('exit', () => writeFileSync(process.env.EXIT_MARKER, String(process.pid)));",
     `await import(${JSON.stringify(new URL(`file:///${fakeSerenaPath.replace(/\\\\/g, '/')}`).href)});`,
+    "if (process.env.HOLD_CHILD_AFTER_STDIN === 'true') setInterval(() => {}, 1000);",
   ].join('\n'));
-  const commandShimPath = join(directory, 'serena.cmd');
-  if (useDefaultCommand) await writeFile(commandShimPath, `@echo off\r\n"${process.execPath}" "${wrapperPath}" %*\r\n`);
+  if (useDefaultCommand) {
+    await copyFile(process.execPath, join(directory, 'serena.exe'));
+    await writeFile(join(directory, 'start-mcp-server'), `await import(${JSON.stringify(new URL(`file:///${wrapperPath.replace(/\\/g, '/')}`).href)});`);
+  }
   const cliArgs = [cliPath, '--manifest', manifestPath, '--status', '127.0.0.1:0'];
   if (!useDefaultCommand) cliArgs.push('--command', process.execPath, '--command-args', JSON.stringify([wrapperPath]));
 
   const child = spawn(process.execPath, cliArgs, {
+    cwd: useDefaultCommand ? directory : undefined,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -64,6 +68,9 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
       SPAWN_MARKER: markerPath,
       EXIT_MARKER: exitMarkerPath,
       PATH: useDefaultCommand ? directory + ';' + process.env.PATH : process.env.PATH,
+      NODE_ENV: taskkillFails ? 'test' : process.env.NODE_ENV,
+      LAZY_SERENA_TEST_TASKKILL_FAIL: taskkillFails ? '1' : '',
+      HOLD_CHILD_AFTER_STDIN: holdChildAfterStdin ? 'true' : 'false',
     },
   });
   const pending = new Map();
@@ -102,6 +109,8 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
   return {
     request,
     status,
+    stderr: () => stderr,
+    child,
     marker: () => existsSync(markerPath) ? readFile(markerPath, 'utf8') : '',
     exitMarker: () => downstreamExited || existsSync(exitMarkerPath),
     async close({ signal = 'SIGTERM', endInput = false } = {}) {
@@ -111,7 +120,17 @@ async function createHarness({ maxQueue = 8, behavior = 'normal', useDefaultComm
       }
       await exited;
       downstreamExited = existsSync(exitMarkerPath);
-      await rm(directory, { recursive: true, force: true });
+      const marker = existsSync(markerPath) ? await readFile(markerPath, 'utf8') : '';
+      const downstreamPid = Number(marker.split(':')[0]);
+      if (Number.isInteger(downstreamPid) && downstreamPid > 0) {
+        await eventually(() => { try { process.kill(downstreamPid, 0); return false; } catch { return true; } });
+      }
+      let cleanupError;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try { await rm(directory, { recursive: true, force: true }); cleanupError = null; break; }
+        catch (error) { cleanupError = error; await delay(50); }
+      }
+      if (cleanupError) throw cleanupError;
     },
   };
 }
@@ -134,7 +153,7 @@ test('first tools/call starts Serena and returns the tool result', async () => {
   try {
     const response = await harness.request('tools/call', { name: 'echo', arguments: { text: 'hello' } });
     assert.deepEqual(response.result, { content: [{ type: 'text', text: 'hello' }] });
-    assert.match(await harness.marker(), /^\d+:\n$/);
+    assert.match(await harness.marker(), /^\d+:/);
     assert.equal((await harness.status()).serena, 'ready');
   } finally {
     await harness.close();
@@ -291,8 +310,14 @@ test('a broken output initiates controlled shutdown without an unhandled rejecti
 });
 
 test('CLI defaults launch the exact Serena MCP command with approved timeouts', async () => {
-  const { PRODUCTION_DEFAULTS, PRODUCTION_SERENA_COMMAND } = await import('../cli.mjs');
-  assert.deepEqual(PRODUCTION_SERENA_COMMAND, { command: 'serena', args: ['start-mcp-server', '--context', 'chatgpt'] });
+  const harness = await createHarness({ useDefaultCommand: true });
+  try {
+    await harness.request('tools/call', { name: 'echo', arguments: { text: 'default' } });
+    assert.match(await harness.marker(), /start-mcp-server\|--context\|chatgpt/);
+  } finally {
+    await harness.close();
+  }
+  const { PRODUCTION_DEFAULTS } = await import('../cli.mjs');
   assert.deepEqual(PRODUCTION_DEFAULTS, { idleTimeoutMs: 900000, startupTimeoutMs: 30000, statusAddress: '127.0.0.1:18012', maxQueuedCalls: 32 });
 });
 
@@ -318,4 +343,81 @@ test('stdin end closes the downstream child', async () => {
     await harness.close({ endInput: true });
   }
   await eventually(() => { try { process.kill(pid, 0); return false; } catch { return true; } });
+});
+
+test('notification method carrying an id receives a response without starting Serena', async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const messages = readMessages(output);
+  const manager = memoryManager();
+  const proxy = createProxyServer({ input, output, manifest: { protocolVersion: '2025-06-18', tools: [echoTool] }, manager, maxQueuedCalls: 2 });
+  proxy.run();
+  input.write('{"jsonrpc":"2.0","id":8,"method":"notifications/initialized"}\n');
+  await eventually(() => messages.length === 1);
+  assert.deepEqual(messages[0], { jsonrpc: '2.0', id: 8, result: {} });
+  assert.equal(manager.starts, 0);
+  await proxy.close();
+});
+
+test('overload explicitly closes transport rather than silently dropping request ids', async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let release;
+  const manager = memoryManager({ callTool: () => new Promise(resolve => { release = resolve; }) });
+  const proxy = createProxyServer({ input, output, manifest: { protocolVersion: '2025-06-18', tools: [echoTool] }, manager, maxQueuedCalls: 1 });
+  proxy.run();
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}\n');
+  await eventually(() => manager.starts === 1);
+  input.write('{"jsonrpc":"2.0","id":2,"method":"ping"}\n');
+  input.write('{"jsonrpc":"2.0","id":3,"method":"ping"}\n');
+  await eventually(() => output.writableEnded, 'overload did not explicitly close the MCP transport');
+  release({ ok: true });
+});
+
+test('rejected response write during active backpressure closes the proxy cleanly', async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.write = () => false;
+  const manager = memoryManager();
+  const proxy = createProxyServer({ input, output, manifest: { protocolVersion: '2025-06-18', tools: [echoTool] }, manager, maxQueuedCalls: 1 });
+  proxy.run();
+  input.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+  await delay(10);
+  output.emit('error', new Error('write rejected while blocked'));
+  await eventually(() => manager.shutdowns === 1);
+});
+
+test('CLI parser rejects IPv6 loopback before loading a manifest', async () => {
+  const child = spawn(process.execPath, [cliPath], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: { ...process.env, LAZY_SERENA_STATUS_ADDR: '::1:18012' },
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const { code } = await new Promise(resolve => child.once('exit', (exitCode, signal) => resolve({ code: exitCode, signal })));
+  assert.equal(code, 1);
+  assert.match(stderr, /LAZY_SERENA_STATUS_ADDR/);
+});
+
+test('CLI keeps a failed-termination proxy alive and reports a nonzero shutdown failure', async () => {
+  const harness = await createHarness({ taskkillFails: true, holdChildAfterStdin: true });
+  let downstreamPid;
+  try {
+    await harness.request('tools/call', { name: 'echo', arguments: { text: 'hold' } });
+    downstreamPid = Number((await harness.marker()).split(':')[0]);
+    harness.child.stdin.end();
+    await delay(7_000);
+    assert.equal(harness.child.exitCode, null);
+    const status = await harness.status();
+    assert.equal(status.serena, 'failed');
+    assert.match(harness.stderr(), /shutdown failed/i);
+    assert.match(status.lastError, /termination failed/i);
+  } finally {
+    if (harness.child.exitCode === null) harness.child.kill('SIGKILL');
+    if (Number.isInteger(downstreamPid) && downstreamPid > 0) {
+      try { process.kill(downstreamPid, 'SIGKILL'); } catch { /* already stopped */ }
+    }
+    await harness.close();
+  }
 });

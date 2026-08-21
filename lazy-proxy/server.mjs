@@ -44,6 +44,7 @@ export function createProxyServer({ input, output, manifest, manager, maxQueuedC
   let closePromise = null;
   let outputTail = Promise.resolve();
   let fatalNotified = false;
+  let transportClosed = false;
 
   const notifyFatal = error => {
     if (fatalNotified) return;
@@ -60,7 +61,14 @@ export function createProxyServer({ input, output, manifest, manager, maxQueuedC
     return closePromise;
   };
 
-  const triggerFatal = error => {
+  const closeTransport = () => {
+    if (transportClosed) return;
+    transportClosed = true;
+    try { output.end(); } catch { /* transport may already be closed */ }
+  };
+
+  const triggerFatal = (error, closeMcpTransport = false) => {
+    if (closeMcpTransport) closeTransport();
     const completion = close();
     completion.then(
       () => notifyFatal(new Error('MCP transport closed')),
@@ -123,6 +131,7 @@ export function createProxyServer({ input, output, manifest, manager, maxQueuedC
         }
         return;
       case 'notifications/initialized':
+        if (!notification) await respond(jsonRpcResult(message.id, {}));
         return;
       case 'ping':
         if (!notification) await respond(jsonRpcResult(message.id, {}));
@@ -141,11 +150,14 @@ export function createProxyServer({ input, output, manifest, manager, maxQueuedC
   const dispatch = (work, requestId = undefined) => {
     if (closed) return;
     if (activeDispatches >= queueLimit) {
-      if (requestId !== undefined && !overflowResponsePending) {
+      if (requestId === undefined) return;
+      if (!overflowResponsePending) {
         overflowResponsePending = true;
         Promise.resolve(respond(jsonRpcError(requestId, -32001, 'Proxy dispatch queue is full', { maxQueuedCalls: queueLimit })))
           .catch(triggerFatal)
           .finally(() => { overflowResponsePending = false; });
+      } else {
+        triggerFatal(new Error('Proxy dispatch queue overflow'), true);
       }
       return;
     }
