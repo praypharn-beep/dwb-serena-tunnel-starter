@@ -51,10 +51,10 @@ function Get-LazyRuntimeConfig {
     }
 
     $ProxyCommandParts = @(
-        (ConvertTo-LazyQuotedArgument $NodeCommand.Source),
-        (ConvertTo-LazyQuotedArgument $ProxyCliPath),
-        '--manifest', (ConvertTo-LazyQuotedArgument $ManifestPath),
-        '--command', (ConvertTo-LazyQuotedArgument $SerenaCommand.Source),
+        (ConvertTo-LazyQuotedArgument $NodeCommand.Source.Replace('\', '/')),
+        (ConvertTo-LazyQuotedArgument $ProxyCliPath.Replace('\', '/')),
+        '--manifest', (ConvertTo-LazyQuotedArgument $ManifestPath.Replace('\', '/')),
+        '--command', (ConvertTo-LazyQuotedArgument $SerenaCommand.Source.Replace('\', '/')),
         '--status', $Script:LazyProductionDefaults.StatusAddress
     )
 

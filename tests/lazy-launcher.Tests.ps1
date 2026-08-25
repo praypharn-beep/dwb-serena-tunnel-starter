@@ -144,10 +144,30 @@ mcp:
     $Command = $Config.ProxyCommand
     Assert-True ($Command.Contains('node')) 'The rendered command must invoke node.'
     Assert-True ($Command.Contains('cli.mjs')) 'The rendered command must invoke lazy-proxy/cli.mjs.'
-    Assert-True ($Command.Contains($Config.ManifestPath)) 'The rendered command must reference the manifest path.'
+    Assert-True ($Command.Contains($Config.ManifestPath.Replace('\', '/'))) 'The rendered command must reference the manifest path using command-parser-safe separators.'
     Assert-True ($Command.Contains('serena')) 'The rendered command must invoke serena.'
     Assert-True ($Command.Contains('127.0.0.1:18012')) 'The rendered command must expose status on 127.0.0.1:18012.'
     Assert-True (-not $Command.Contains("`n")) 'The rendered command must be a single line, safe to embed in YAML.'
+
+    Write-Host 'Checking tunnel-client accepts the rendered Windows executable path...'
+    $TunnelClientPath = Join-Path $RepoRoot 'tunnel-client\tunnel-client.exe'
+    if (Test-Path -LiteralPath $TunnelClientPath) {
+        $DoctorProfilePath = Join-Path (New-TrackedLazyTestDirectory) 'doctor-rendered.yaml'
+        Write-LazyTunnelProfile -TemplatePath $TemplatePath -DestinationPath $DoctorProfilePath -TunnelId $FakeTunnelId -ProxyCommand $Command | Out-Null
+        $PreviousControlPlaneApiKey = $env:CONTROL_PLANE_API_KEY
+        $env:CONTROL_PLANE_API_KEY = 'test-only-doctor-key'
+        try {
+            $DoctorOutput = & $TunnelClientPath doctor --config $DoctorProfilePath --explain 2>&1
+            $DoctorExitCode = $LASTEXITCODE
+        }
+        finally {
+            $env:CONTROL_PLANE_API_KEY = $PreviousControlPlaneApiKey
+        }
+        Assert-True ($DoctorExitCode -eq 0) "tunnel-client doctor must accept the executable token emitted by Get-LazyRuntimeConfig. Exit: $DoctorExitCode Output: $($DoctorOutput -join [Environment]::NewLine)"
+    }
+    else {
+        Write-Host 'Skipping tunnel-client parser integration check because tunnel-client.exe is not installed.' -ForegroundColor Yellow
+    }
 
     Write-Host 'Checking API key handling never leaks plaintext...'
     $PlaintextSecret = 'super-secret-control-plane-key-value'
