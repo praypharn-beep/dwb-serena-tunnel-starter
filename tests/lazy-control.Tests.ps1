@@ -257,6 +257,36 @@ try {
     Assert-True ($null -eq $NoProxyResult.ProxyPid) 'Start must report a null proxy PID when discovery times out.'
     Assert-True ($null -eq (Read-LazyPidFile -Path $NoProxyPaths.ProxyPidPath)) 'Start must not write a proxy PID file when discovery times out.'
 
+    Write-Host 'Checking Start-LazyControlStack rejects a supervisor that exits before proxy discovery and removes its stale PID...'
+    $ExitedDirectory = New-TrackedLazyTestDirectory
+    $ExitedDestination = Join-Path $ExitedDirectory 'rendered.yaml'
+    $ExitedConfig = New-FakeRuntimeConfig -Directory $ExitedDirectory -DestinationPath $ExitedDestination
+    $ExitedPaths = New-FakeControlPaths $ExitedDirectory
+    $ExitedProcess = [pscustomobject]@{ Id = 8101; HasExited = $true; ExitCode = 17 }
+    $ExitedTimeQueue = New-Object System.Collections.Generic.Queue[datetime]
+    $ExitedBase = Get-Date '2026-08-25T10:00:00'
+    foreach ($OffsetMs in @(0, 2)) { $ExitedTimeQueue.Enqueue($ExitedBase.AddMilliseconds($OffsetMs)) }
+    $ExitedNowProvider = { if ($ExitedTimeQueue.Count -gt 0) { $ExitedTimeQueue.Dequeue() } else { $ExitedBase.AddMilliseconds(999999) } }.GetNewClosure()
+    $ExitedSupervisorFailed = $false
+    $ExitedSupervisorMessage = $null
+    try {
+        Start-LazyControlStack -RepoRoot $RepoRoot -Paths $ExitedPaths `
+            -ConfigProvider { param($RepoRootArg) $ExitedConfig }.GetNewClosure() `
+            -ProcessLauncher { param($FilePath, $ArgumentList, $WorkingDirectory) $ExitedProcess }.GetNewClosure() `
+            -ProcessEnumerator { , @() }.GetNewClosure() `
+            -DiscoveryTimeoutMs 1 `
+            -Sleeper { param($Milliseconds) } `
+            -NowProvider $ExitedNowProvider | Out-Null
+    }
+    catch {
+        $ExitedSupervisorFailed = $true
+        $ExitedSupervisorMessage = $_.Exception.Message
+    }
+    Assert-True $ExitedSupervisorFailed 'Start must throw when the launched supervisor exits before proxy discovery.'
+    Assert-True ($ExitedSupervisorMessage -match 'exit code 17') 'Start failure must preserve the exited supervisor code for diagnosis.'
+    Assert-True (-not (Test-Path -LiteralPath $ExitedPaths.TunnelPidPath)) 'Start must remove its just-written supervisor PID when that supervisor already exited.'
+    Assert-True (-not (Test-Path -LiteralPath $ExitedPaths.ProxyPidPath)) 'Start must not leave a proxy PID when the supervisor exited before discovery.'
+
     Write-Host 'Checking Start-LazyControlStack fails clearly when the launcher does not return a process...'
     $FailDirectory = New-TrackedLazyTestDirectory
     $FailDestination = Join-Path $FailDirectory 'rendered.yaml'

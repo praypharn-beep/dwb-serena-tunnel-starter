@@ -169,9 +169,21 @@ function Start-LazyControlStack {
     }
     Set-Content -LiteralPath $Paths.TunnelPidPath -Value ([string]$Process.Id) -Encoding ascii -NoNewline
 
+    $AssertSupervisorRunning = {
+        if ($Process.HasExited) {
+            $ExitCode = $Process.ExitCode
+            if ((Read-LazyPidFile -Path $Paths.TunnelPidPath) -eq $Process.Id) {
+                Remove-Item -LiteralPath $Paths.TunnelPidPath -Force -ErrorAction SilentlyContinue
+            }
+            throw "Lazy tunnel supervisor exited before proxy discovery (exit code $ExitCode)."
+        }
+    }
+    & $AssertSupervisorRunning
+
     $ProxyProcessId = $null
     $Deadline = (& $NowProvider).AddMilliseconds($DiscoveryTimeoutMs)
     while ((& $NowProvider) -lt $Deadline) {
+        & $AssertSupervisorRunning
         $Candidates = & $ProcessEnumerator
         $Match = $Candidates | Where-Object {
             $_.ExecutablePath -and $_.CommandLine -and
