@@ -189,7 +189,7 @@ function Start-LazyControlStack {
             $_.ExecutablePath -and $_.CommandLine -and
             ($_.ExecutablePath -ieq $Config.NodePath) -and
             ($_.CommandLine.Contains('cli.mjs')) -and
-            ($_.CommandLine.Contains($Config.ManifestPath))
+            ($_.CommandLine.Contains($Config.ManifestPath.Replace('\', '/')))
         } | Select-Object -First 1
         if ($Match) { $ProxyProcessId = $Match.Id; break }
         & $Sleeper $DiscoveryPollMs
@@ -235,7 +235,7 @@ function Get-LazyControlStatus {
     $ProxyVerified = $false
     if ($ProxyPid) {
         $ProxyInfo = & $ProcessInspector $ProxyPid
-        $ProxyVerified = Confirm-LazyProcessMatch -ProcessInfo $ProxyInfo -ExpectedExecutablePath $Config.NodePath -RequiredCommandLineSubstrings @('cli.mjs', $Config.ManifestPath)
+        $ProxyVerified = Confirm-LazyProcessMatch -ProcessInfo $ProxyInfo -ExpectedExecutablePath $Config.NodePath -RequiredCommandLineSubstrings @('cli.mjs', $Config.ManifestPath.Replace('\', '/'))
     }
 
     $StatusUrl = "http://$($Config.StatusAddress)/status"
@@ -499,7 +499,7 @@ function Stop-LazyControlStack {
     }
     else {
         $ProxyOutcome = Stop-LazyVerifiedTarget -ProcessId $ProxyPid `
-            -ExpectedExecutablePath $Config.NodePath -RequiredCommandLineSubstrings @('cli.mjs', $Config.ManifestPath) `
+            -ExpectedExecutablePath $Config.NodePath -RequiredCommandLineSubstrings @('cli.mjs', $Config.ManifestPath.Replace('\', '/')) `
             -ProcessInspector $ProcessInspector -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
             -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
         if (-not $ProxyOutcome.Attempted) {

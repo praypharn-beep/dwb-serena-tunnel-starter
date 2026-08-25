@@ -74,7 +74,9 @@ function New-FakeRuntimeConfig([string]$Directory, [string]$DestinationPath) {
     $TemplatePath = New-FakeTemplateFile $Directory
     $ManifestPath = Join-Path $RepoRoot 'lazy-proxy\serena-tools.json'
     $NodePath = 'C:\Program Files\nodejs\node.exe'
-    $ProxyCommand = "`"$NodePath`" `"$RepoRoot\lazy-proxy\cli.mjs`" --manifest `"$ManifestPath`" --command `"C:\serena\serena.exe`" --status 127.0.0.1:18012"
+    # Mirror Get-LazyRuntimeConfig: command-line paths are parser-safe forward slashes while
+    # ManifestPath remains the normal Windows path used by control/status/stop identity checks.
+    $ProxyCommand = ("`"$NodePath`" `"$RepoRoot\lazy-proxy\cli.mjs`" --manifest `"$ManifestPath`" --command `"C:\serena\serena.exe`" --status 127.0.0.1:18012").Replace('\', '/')
     return [pscustomobject]@{
         RepoRoot               = $RepoRoot
         NodePath                = $NodePath
