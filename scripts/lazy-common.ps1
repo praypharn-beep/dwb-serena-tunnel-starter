@@ -132,7 +132,16 @@ function Get-DpapiApiKey {
     if (-not (Test-Path -LiteralPath $SecretPath)) { throw "DPAPI secret file not found: $SecretPath" }
     try {
         $EncryptedKey = (Get-Content -Raw -LiteralPath $SecretPath).Trim()
-        $SecureKey = ConvertTo-SecureString $EncryptedKey
+        $PreviousPSModulePath = $env:PSModulePath
+        try {
+            $env:PSModulePath = Join-Path $PSHOME 'Modules'
+            $SecurityModuleManifest = Join-Path $env:PSModulePath 'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+            Import-Module -Name $SecurityModuleManifest -Force -ErrorAction Stop
+            $SecureKey = ConvertTo-SecureString $EncryptedKey
+        }
+        finally {
+            $env:PSModulePath = $PreviousPSModulePath
+        }
         $PlaintextKey = [System.Net.NetworkCredential]::new('', $SecureKey).Password
     }
     catch {

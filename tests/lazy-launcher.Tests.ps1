@@ -191,6 +191,74 @@ mcp:
     $ConfigDump = ($Config | Format-List | Out-String)
     Assert-True (-not $ConfigDump.Contains($PlaintextSecret)) 'Get-LazyRuntimeConfig output must never contain decrypted API key plaintext.'
 
+    Write-Host 'Checking DPAPI decrypt survives an incompatible security module earlier in a fresh Windows PowerShell child...'
+    $ShadowDirectory = New-TrackedLazyTestDirectory
+    $ShadowModuleRoot = Join-Path $ShadowDirectory 'modules'
+    $ShadowVersionDirectory = Join-Path $ShadowModuleRoot 'Microsoft.PowerShell.Security\99.0.0'
+    New-Item -ItemType Directory -Path $ShadowVersionDirectory -Force | Out-Null
+    $ShadowManifestPath = Join-Path $ShadowVersionDirectory 'Microsoft.PowerShell.Security.psd1'
+    $ShadowModulePath = Join-Path $ShadowVersionDirectory 'Microsoft.PowerShell.Security.psm1'
+    Set-Content -LiteralPath $ShadowManifestPath -Encoding utf8 -Value @'
+@{
+    RootModule = 'Microsoft.PowerShell.Security.psm1'
+    ModuleVersion = '99.0.0'
+    GUID = '11111111-2222-3333-4444-555555555555'
+    FunctionsToExport = @('ConvertTo-SecureString')
+    CmdletsToExport = @()
+    VariablesToExport = @()
+    AliasesToExport = @()
+}
+'@
+    Set-Content -LiteralPath $ShadowModulePath -Encoding utf8 -Value '# Deliberately advertises but does not provide ConvertTo-SecureString.'
+
+    $ShadowSecureValue = New-Object System.Security.SecureString
+    foreach ($CharacterCode in @(115, 121, 110, 116, 104, 101, 116, 105, 99)) {
+        $ShadowSecureValue.AppendChar([char]$CharacterCode)
+    }
+    $ShadowSecretPath = Join-Path $ShadowDirectory 'synthetic.dpapi'
+    (ConvertFrom-SecureString -SecureString $ShadowSecureValue) | Set-Content -LiteralPath $ShadowSecretPath -Encoding ascii
+    $ShadowSecureValue.Dispose()
+
+    $ChildScriptPath = Join-Path $ShadowDirectory 'decrypt-child.ps1'
+    $ChildStdoutPath = Join-Path $ShadowDirectory 'decrypt-child.stdout.txt'
+    $ChildStderrPath = Join-Path $ShadowDirectory 'decrypt-child.stderr.txt'
+    $EscapedCommonPath = (Join-Path $RepoRoot 'scripts\lazy-common.ps1').Replace("'", "''")
+    $EscapedSecretPath = $ShadowSecretPath.Replace("'", "''")
+    $ChildScript = @'
+$ErrorActionPreference = 'Stop'
+. '__COMMON_PATH__'
+try {
+    $Decrypted = Get-DpapiApiKey -SecretPath '__SECRET_PATH__'
+    if ([string]::IsNullOrWhiteSpace($Decrypted)) { exit 21 }
+    $Decrypted = $null
+    [Console]::Out.WriteLine('SUCCESS')
+    exit 0
+}
+catch {
+    [Console]::Error.WriteLine($_.FullyQualifiedErrorId)
+    exit 22
+}
+'@
+    $ChildScript = $ChildScript.Replace('__COMMON_PATH__', $EscapedCommonPath).Replace('__SECRET_PATH__', $EscapedSecretPath)
+    Set-Content -LiteralPath $ChildScriptPath -Encoding utf8 -Value $ChildScript
+
+    $PreviousPSModulePath = $env:PSModulePath
+    try {
+        $env:PSModulePath = $ShadowModuleRoot + [System.IO.Path]::PathSeparator + $PreviousPSModulePath
+        $ChildProcess = Start-Process -FilePath (Get-Command powershell.exe).Source `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$ChildScriptPath`"") `
+            -RedirectStandardOutput $ChildStdoutPath -RedirectStandardError $ChildStderrPath `
+            -WindowStyle Hidden -Wait -PassThru
+    }
+    finally {
+        $env:PSModulePath = $PreviousPSModulePath
+    }
+    $ChildStdout = Get-Content -Raw -LiteralPath $ChildStdoutPath -ErrorAction SilentlyContinue
+    $ChildStderr = Get-Content -Raw -LiteralPath $ChildStderrPath -ErrorAction SilentlyContinue
+    Assert-True ($ChildProcess.ExitCode -eq 0) "A fresh Windows PowerShell child must decrypt a synthetic DPAPI value even when PSModulePath starts with an incompatible Microsoft.PowerShell.Security module. Exit: $($ChildProcess.ExitCode); stderr: $ChildStderr"
+    Assert-True ($ChildStdout.Trim() -eq 'SUCCESS') 'The child must report success without printing the decrypted synthetic value.'
+    Assert-True ([string]::IsNullOrWhiteSpace($ChildStderr)) 'The successful child must not emit an error or decrypted value to stderr.'
+
     Write-Host 'Checking the bounded restart policy...'
     $FakeConfig = [pscustomobject]@{
         RepoRoot               = $RepoRoot
