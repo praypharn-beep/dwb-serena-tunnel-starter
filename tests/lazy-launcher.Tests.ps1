@@ -4,6 +4,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $RepoRoot 'scripts\lazy-common.ps1')
 
 $FakeTunnelId = 'tunnel_0123456789abcdef0123456789abcdef'
+$FakeOrganizationId = 'org-aaaaaaaaaaaaaaaaaaaaaaaa'
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
@@ -125,8 +126,17 @@ mcp:
     Assert-True $ThrewOnNewline 'A value containing a newline must be rejected rather than unsafely embedded.'
 
     Write-Host 'Checking the runtime config and rendered command...'
-    $Config = Get-LazyRuntimeConfig -RepoRoot $RepoRoot -TunnelIdOverride $FakeTunnelId
+    $Config = Get-LazyRuntimeConfig -RepoRoot $RepoRoot -TunnelIdOverride $FakeTunnelId -OrganizationIdOverride $FakeOrganizationId
     Assert-True ($Config.TunnelId -eq $FakeTunnelId) 'Get-LazyRuntimeConfig must honor an explicit tunnel ID override.'
+    Assert-True ($Config.OrganizationId -eq $FakeOrganizationId) 'Runtime config must return the validated Organization ID.'
+    $InvalidOrganizationRejected = $false
+    try {
+        Get-LazyRuntimeConfig -RepoRoot $RepoRoot -TunnelIdOverride $FakeTunnelId -OrganizationIdOverride 'not-an-org-id' | Out-Null
+    }
+    catch {
+        $InvalidOrganizationRejected = $true
+    }
+    Assert-True $InvalidOrganizationRejected 'Runtime config must reject a malformed Organization ID before launch.'
     Assert-True ($Config.ManifestPath -eq (Join-Path $RepoRoot 'lazy-proxy\serena-tools.json')) 'Get-LazyRuntimeConfig must resolve the Task 4 manifest path exactly.'
     Assert-True (Test-Path $Config.ManifestPath) 'The resolved manifest path must exist.'
     Assert-True ($Config.IdleTimeoutMs -eq 900000) 'The approved idle timeout is 900000 ms.'
@@ -189,6 +199,7 @@ mcp:
         ProfileTemplatePath    = $TemplatePath
         ProfileDestinationPath = Join-Path (New-TrackedLazyTestDirectory) 'rendered-supervisor.yaml'
         TunnelId                = $FakeTunnelId
+        OrganizationId          = $FakeOrganizationId
         ProxyCommand            = $FakeProxyCommand
         IdleTimeoutMs           = 900000
         StartupTimeoutMs        = 30000
@@ -308,12 +319,16 @@ mcp:
 
     Write-Host 'Checking CONTROL_PLANE_API_KEY is populated during launch and cleared afterward...'
     Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)) 'Test precondition failed: CONTROL_PLANE_API_KEY must not already be set in this process before this check runs.'
+    Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)) 'Organization environment precondition must be empty.'
 
     $ObservedApiKey = @{ WasSet = $false; Value = $null }
+    $ObservedOrganization = @{ WasSet = $false; Value = $null }
     $ApiKeyObservingLauncher = {
         param($FilePath, $ArgumentList, $WorkingDirectory)
         $ObservedApiKey.WasSet = -not [string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)
         $ObservedApiKey.Value = $env:CONTROL_PLANE_API_KEY
+        $ObservedOrganization.WasSet = -not [string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)
+        $ObservedOrganization.Value = $env:CONTROL_PLANE_ORGANIZATION_ID
         [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
     }.GetNewClosure()
     Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 1 -RestartWindowMinutes 10 -Once `
@@ -327,6 +342,9 @@ mcp:
     Assert-True $ObservedApiKey.WasSet 'CONTROL_PLANE_API_KEY must actually be populated in the environment at the moment the tunnel process is launched.'
     Assert-True ($ObservedApiKey.Value -eq $DecryptedSecret) 'The environment variable observed during launch must equal the real decrypted API key, not a placeholder.'
     Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)) 'CONTROL_PLANE_API_KEY must be cleared from the environment after Start-LazyTunnel returns on the success path.'
+    Assert-True $ObservedOrganization.WasSet 'Organization context must exist when the child launches.'
+    Assert-True ($ObservedOrganization.Value -eq $FakeOrganizationId) 'The child must receive the configured Organization ID.'
+    Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)) 'Organization context must clear after success.'
 
     Write-Host 'Checking CONTROL_PLANE_API_KEY is cleared even when the launcher throws...'
     $ThrowingLauncher = {
@@ -338,6 +356,7 @@ mcp:
         -ProcessLauncher $ThrowingLauncher `
         -NowProvider { Get-Date } | Out-Null
     Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)) 'CONTROL_PLANE_API_KEY must be cleared from the environment even when the launcher throws.'
+    Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)) 'Organization context must clear after failure.'
 
     Write-Host 'All lazy launcher checks passed.' -ForegroundColor Green
 }

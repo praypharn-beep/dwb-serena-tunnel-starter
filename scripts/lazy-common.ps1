@@ -23,7 +23,8 @@ function ConvertTo-LazyQuotedArgument {
 function Get-LazyRuntimeConfig {
     param(
         [Parameter(Mandatory)] [string]$RepoRoot,
-        [string]$TunnelIdOverride
+        [string]$TunnelIdOverride,
+        [string]$OrganizationIdOverride
     )
 
     $NodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -41,13 +42,17 @@ function Get-LazyRuntimeConfig {
     if (-not (Test-Path -LiteralPath $ManifestPath)) { throw "Serena tool manifest not found: $ManifestPath" }
 
     $TunnelId = $TunnelIdOverride
-    if ([string]::IsNullOrWhiteSpace($TunnelId)) {
+    $OrganizationId = $OrganizationIdOverride
+    if ([string]::IsNullOrWhiteSpace($TunnelId) -or [string]::IsNullOrWhiteSpace($OrganizationId)) {
         $LocalConfigPath = Join-Path $RepoRoot 'config\team.ps1'
         if (-not (Test-Path -LiteralPath $LocalConfigPath)) { throw "Tunnel configuration not found: $LocalConfigPath" }
         . $LocalConfigPath
     }
     if ([string]::IsNullOrWhiteSpace($TunnelId) -or $TunnelId -cnotmatch '^tunnel_[0-9a-f]{32}$') {
         throw 'Tunnel ID is missing or invalid.'
+    }
+    if ([string]::IsNullOrWhiteSpace($OrganizationId) -or $OrganizationId -cnotmatch '^org-[A-Za-z0-9]{20,}$') {
+        throw 'Organization ID is missing or invalid.'
     }
 
     $ProxyCommandParts = @(
@@ -69,6 +74,7 @@ function Get-LazyRuntimeConfig {
         ProfileTemplatePath     = Join-Path $RepoRoot 'profiles\serena-team.yaml'
         ProfileDestinationPath  = Join-Path $env:APPDATA 'tunnel-client\dwb-serena.yaml'
         TunnelId                = $TunnelId
+        OrganizationId          = $OrganizationId
         IdleTimeoutMs           = $Script:LazyProductionDefaults.IdleTimeoutMs
         StartupTimeoutMs        = $Script:LazyProductionDefaults.StartupTimeoutMs
         StatusAddress           = $Script:LazyProductionDefaults.StatusAddress
@@ -173,6 +179,7 @@ function Start-LazyTunnel {
             $StartTimestamps.Add($Now)
 
             $env:CONTROL_PLANE_API_KEY = $ApiKey
+            $env:CONTROL_PLANE_ORGANIZATION_ID = $Config.OrganizationId
             try {
                 $WorkingDirectory = Split-Path -Parent $Config.TunnelClientPath
                 $Process = & $ProcessLauncher $Config.TunnelClientPath @('run', '--profile', 'dwb-serena') $WorkingDirectory
@@ -192,6 +199,7 @@ function Start-LazyTunnel {
             }
             finally {
                 $env:CONTROL_PLANE_API_KEY = $null
+                $env:CONTROL_PLANE_ORGANIZATION_ID = $null
             }
         } while (-not $Once)
 
@@ -200,5 +208,6 @@ function Start-LazyTunnel {
     finally {
         $ApiKey = $null
         $env:CONTROL_PLANE_API_KEY = $null
+        $env:CONTROL_PLANE_ORGANIZATION_ID = $null
     }
 }
