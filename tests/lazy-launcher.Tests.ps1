@@ -144,10 +144,53 @@ mcp:
     $Command = $Config.ProxyCommand
     Assert-True ($Command.Contains('node')) 'The rendered command must invoke node.'
     Assert-True ($Command.Contains('cli.mjs')) 'The rendered command must invoke lazy-proxy/cli.mjs.'
-    Assert-True ($Command.Contains($Config.ManifestPath)) 'The rendered command must reference the manifest path.'
+    Assert-True ($Command.Contains($Config.ManifestPath.Replace('\', '/'))) 'The rendered command must reference the manifest path using command-parser-safe separators.'
     Assert-True ($Command.Contains('serena')) 'The rendered command must invoke serena.'
     Assert-True ($Command.Contains('127.0.0.1:18012')) 'The rendered command must expose status on 127.0.0.1:18012.'
     Assert-True (-not $Command.Contains("`n")) 'The rendered command must be a single line, safe to embed in YAML.'
+
+    Write-Host 'Checking tunnel-client accepts the rendered Windows executable path...'
+    $TunnelClientPath = Join-Path $RepoRoot 'tunnel-client\tunnel-client.exe'
+    if (Test-Path -LiteralPath $TunnelClientPath) {
+        $DoctorDirectory = New-TrackedLazyTestDirectory
+        $DoctorProfilePath = Join-Path $DoctorDirectory 'doctor-rendered.yaml'
+        $DoctorTemplatePath = Join-Path $DoctorDirectory 'doctor-template.yaml'
+
+        # Keep the production-template regression check on 18010 above, but isolate the doctor
+        # integration check from any production/runtime listener by asking the OS for an available
+        # loopback port and using it only in this temporary doctor-specific template.
+        $PortProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        try {
+            $PortProbe.Start()
+            $DoctorHealthPort = ([System.Net.IPEndPoint]$PortProbe.LocalEndpoint).Port
+        }
+        finally {
+            $PortProbe.Stop()
+        }
+        $DoctorHealthAddress = "127.0.0.1:$DoctorHealthPort"
+        $DoctorTemplate = (Get-Content -Raw -LiteralPath $TemplatePath).Replace(
+            'listen_addr: 127.0.0.1:18010',
+            "listen_addr: $DoctorHealthAddress"
+        )
+        Assert-True ($DoctorTemplate.Contains("listen_addr: $DoctorHealthAddress")) 'Doctor test setup must inject its isolated loopback health port.'
+        Assert-True (-not $DoctorTemplate.Contains('listen_addr: 127.0.0.1:18010')) 'Doctor integration config must not use the production health port.'
+        Set-Content -LiteralPath $DoctorTemplatePath -Encoding utf8 -Value $DoctorTemplate
+        Write-LazyTunnelProfile -TemplatePath $DoctorTemplatePath -DestinationPath $DoctorProfilePath -TunnelId $FakeTunnelId -ProxyCommand $Command | Out-Null
+        Write-Host "Doctor integration health port: $DoctorHealthAddress"
+        $PreviousControlPlaneApiKey = $env:CONTROL_PLANE_API_KEY
+        $env:CONTROL_PLANE_API_KEY = 'test-only-doctor-key'
+        try {
+            $DoctorOutput = & $TunnelClientPath doctor --config $DoctorProfilePath --explain 2>&1
+            $DoctorExitCode = $LASTEXITCODE
+        }
+        finally {
+            $env:CONTROL_PLANE_API_KEY = $PreviousControlPlaneApiKey
+        }
+        Assert-True ($DoctorExitCode -eq 0) "tunnel-client doctor must accept the executable token emitted by Get-LazyRuntimeConfig. Exit: $DoctorExitCode Output: $($DoctorOutput -join [Environment]::NewLine)"
+    }
+    else {
+        Write-Host 'Skipping tunnel-client parser integration check because tunnel-client.exe is not installed.' -ForegroundColor Yellow
+    }
 
     Write-Host 'Checking API key handling never leaks plaintext...'
     $PlaintextSecret = 'super-secret-control-plane-key-value'
