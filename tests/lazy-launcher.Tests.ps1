@@ -164,6 +164,15 @@ mcp:
     if (Test-Path -LiteralPath $TunnelClientPath) {
         $DoctorProfilePath = Join-Path (New-TrackedLazyTestDirectory) 'doctor-rendered.yaml'
         Write-LazyTunnelProfile -TemplatePath $TemplatePath -DestinationPath $DoctorProfilePath -TunnelId $FakeTunnelId -ProxyCommand $Command | Out-Null
+        # Doctor binds the configured health listener. Use an ephemeral loopback port so this test
+        # never collides with the real production tunnel on 127.0.0.1:18010.
+        $EphemeralListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $EphemeralListener.Start()
+        $DoctorHealthPort = ([System.Net.IPEndPoint]$EphemeralListener.LocalEndpoint).Port
+        $EphemeralListener.Stop()
+        $DoctorProfileContent = Get-Content -Raw -LiteralPath $DoctorProfilePath
+        $DoctorProfileContent = $DoctorProfileContent.Replace('listen_addr: 127.0.0.1:18010', "listen_addr: 127.0.0.1:$DoctorHealthPort")
+        Set-Content -LiteralPath $DoctorProfilePath -Value $DoctorProfileContent -Encoding utf8 -NoNewline
         $PreviousControlPlaneApiKey = $env:CONTROL_PLANE_API_KEY
         $env:CONTROL_PLANE_API_KEY = 'test-only-doctor-key'
         try {
@@ -278,13 +287,14 @@ catch {
     # to a $script:-scoped scalar from inside a closure do not propagate back to the caller. A
     # Hashtable is a reference type, so the captured reference still points at the same shared
     # object and mutations to its entries are visible everywhere.
-    $RestartState = @{ LaunchCount = 0; FakeNow = Get-Date '2026-08-21T09:00:00' }
+    $RestartState = @{ LaunchCount = 0; FakeNow = Get-Date '2026-08-21T09:00:00'; Sleeps = New-Object System.Collections.Generic.List[int] }
     $NowProvider = { $RestartState.FakeNow }.GetNewClosure()
     $ProcessLauncher = {
         param($FilePath, $ArgumentList, $WorkingDirectory)
         $RestartState.LaunchCount += 1
         $RestartState.FakeNow = $RestartState.FakeNow.AddMinutes(1)
         [pscustomobject]@{
+            Id = 4321
             ExitCode = 1
         } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
     }.GetNewClosure()
@@ -294,6 +304,7 @@ catch {
         Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 `
             -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
             -ProcessLauncher $ProcessLauncher `
+            -Sleeper { param($Seconds) $RestartState.Sleeps.Add([int]$Seconds) }.GetNewClosure() `
             -NowProvider $NowProvider | Out-Null
     }
     catch {
@@ -301,15 +312,26 @@ catch {
     }
     Assert-True $BoundExceeded 'Start-LazyTunnel must stop supervising once the restart bound is exceeded.'
     Assert-True ($RestartState.LaunchCount -eq 3) "Start-LazyTunnel must allow exactly 3 starts within the 10 minute window before stopping, launched $($RestartState.LaunchCount) times."
+    Assert-True ((($RestartState.Sleeps.ToArray()) -join ',') -eq '5,10') 'Restart backoff must grow 5s -> 10s between retry attempts and must not sleep after the final allowed start.'
 
-    Write-Host 'Checking -Once disables restart...'
+    Write-Host 'Checking -Once disables restart and lifecycle callbacks are emitted...'
     $RestartState.LaunchCount = 0
     $RestartState.FakeNow = Get-Date '2026-08-21T09:00:00'
+    $Lifecycle = @{ Started = 0; Exited = 0; StartedPid = $null; ExitCode = $null; Logs = New-Object System.Collections.Generic.List[string] }
     Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 -Once `
         -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
         -ProcessLauncher $ProcessLauncher `
+        -ProcessStarted { param($Process, $ConfigArg) $Lifecycle.Started += 1; $Lifecycle.StartedPid = $Process.Id }.GetNewClosure() `
+        -ProcessExited { param($Process, $ExitCodeArg, $ConfigArg) $Lifecycle.Exited += 1; $Lifecycle.ExitCode = $ExitCodeArg }.GetNewClosure() `
+        -EventLogger { param($Message) $Lifecycle.Logs.Add([string]$Message) }.GetNewClosure() `
         -NowProvider $NowProvider | Out-Null
     Assert-True ($RestartState.LaunchCount -eq 1) '-Once must make exactly one start attempt and then return.'
+    Assert-True ($Lifecycle.Started -eq 1) 'Start-LazyTunnel must invoke ProcessStarted once for a launched child.'
+    Assert-True ($Lifecycle.StartedPid -eq 4321) 'ProcessStarted must receive the launched child PID.'
+    Assert-True ($Lifecycle.Exited -eq 1) 'Start-LazyTunnel must invoke ProcessExited once after the child exits.'
+    Assert-True ($Lifecycle.ExitCode -eq 1) 'ProcessExited must receive the child exit code.'
+    Assert-True (($Lifecycle.Logs -join "`n") -match 'tunnel-client-started pid=4321') 'EventLogger must receive a sanitized child-start event.'
+    Assert-True (($Lifecycle.Logs -join "`n") -match 'tunnel-client-exited pid=4321 code=1') 'EventLogger must receive a sanitized child-exit event.'
 
     Write-Host 'Checking the sliding restart window expires old events...'
     $RestartState.LaunchCount = 0
@@ -336,6 +358,7 @@ catch {
         Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 `
             -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
             -ProcessLauncher $WindowLauncher `
+            -Sleeper { param($Seconds) } `
             -NowProvider $WindowNowProvider | Out-Null
     }
     catch {

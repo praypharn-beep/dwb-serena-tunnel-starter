@@ -194,6 +194,8 @@ Lazy-Control.cmd uninstall   Remove the logon task, stop the stack, and restore 
 Details:
 
 - The logon task is named **`DWB Serena Lazy Tunnel`**, triggers `AtLogOn` for the current Windows user only, runs a **hidden** PowerShell window, and is registered with a **non-elevated (Limited)** run level — it never requests administrator rights.
+- `install` persists resilience settings for the long-running tunnel: `StartWhenAvailable`, restart-on-failure (10 attempts at 1-minute intervals), unlimited execution time, `IgnoreNew` duplicate-instance protection, battery-safe continuation, and idle-end termination disabled.
+- The supervisor records its own PID, the active `tunnel-client.exe` PID, the lazy proxy PID, and a bounded lifecycle log under `%APPDATA%\tunnel-client\`. This keeps an orphan client identifiable if the supervisor is terminated externally.
 - `install` and `start` render the tunnel profile from the same template `Start.cmd` uses, so the profile always points at the lazy proxy, never at Serena directly.
 - `install` **backs up the current tunnel profile** before rendering, to `%APPDATA%\tunnel-client\backups\dwb-serena.<UTC timestamp>.yaml` (for example `dwb-serena.20260821T100000Z.yaml`), before overwriting it.
 - `stop` and `uninstall` verify a managed process's **executable path and command line** before sending it any stop signal, and re-verify immediately before a forced termination. A missing, stale, or reused PID is left alone rather than acted on — see [Security](#security) below.

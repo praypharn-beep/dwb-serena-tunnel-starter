@@ -40,10 +40,12 @@ function New-FakeControlPaths([string]$Root) {
     $Base = Join-Path $Root 'appdata-tunnel-client'
     $Backups = Join-Path $Base 'backups'
     return [pscustomobject]@{
-        BaseDirectory   = $Base
-        TunnelPidPath   = Join-Path $Base 'dwb-serena-tunnel.pid'
-        ProxyPidPath    = Join-Path $Base 'dwb-serena-proxy.pid'
-        BackupDirectory = $Backups
+        BaseDirectory       = $Base
+        TunnelPidPath       = Join-Path $Base 'dwb-serena-tunnel.pid'
+        TunnelClientPidPath = Join-Path $Base 'dwb-serena-tunnel-client.pid'
+        ProxyPidPath        = Join-Path $Base 'dwb-serena-proxy.pid'
+        SupervisorLogPath   = Join-Path $Base 'dwb-serena-supervisor.log'
+        BackupDirectory     = $Backups
     }
 }
 
@@ -100,9 +102,23 @@ try {
     $FakeAppData = Join-Path (New-TrackedLazyTestDirectory) 'AppData\Roaming'
     $Paths = Get-LazyControlPaths -AppDataRoot $FakeAppData
     Assert-Equal (Join-Path $FakeAppData 'tunnel-client') $Paths.BaseDirectory 'Get-LazyControlPaths must derive BaseDirectory from the supplied AppData root.'
-    Assert-Equal (Join-Path $Paths.BaseDirectory 'dwb-serena-tunnel.pid') $Paths.TunnelPidPath 'Get-LazyControlPaths must name the tunnel PID file exactly.'
+    Assert-Equal (Join-Path $Paths.BaseDirectory 'dwb-serena-tunnel.pid') $Paths.TunnelPidPath 'Get-LazyControlPaths must name the supervisor PID file exactly.'
+    Assert-Equal (Join-Path $Paths.BaseDirectory 'dwb-serena-tunnel-client.pid') $Paths.TunnelClientPidPath 'Get-LazyControlPaths must name the tunnel-client PID file exactly.'
     Assert-Equal (Join-Path $Paths.BaseDirectory 'dwb-serena-proxy.pid') $Paths.ProxyPidPath 'Get-LazyControlPaths must name the proxy PID file exactly.'
+    Assert-Equal (Join-Path $Paths.BaseDirectory 'dwb-serena-supervisor.log') $Paths.SupervisorLogPath 'Get-LazyControlPaths must name the supervisor log exactly.'
     Assert-Equal (Join-Path $Paths.BaseDirectory 'backups') $Paths.BackupDirectory 'Get-LazyControlPaths must name the backups directory exactly.'
+
+    Write-Host 'Checking PID ownership helpers and persistent supervisor log...'
+    $OwnedPidPath = Join-Path $Paths.BaseDirectory 'owned.pid'
+    Set-LazyPidFile -Path $OwnedPidPath -ProcessId 4242
+    Assert-Equal '4242' ((Get-Content -Raw -LiteralPath $OwnedPidPath).Trim()) 'Set-LazyPidFile must persist the exact PID.'
+    Remove-LazyPidFileIfOwned -Path $OwnedPidPath -ProcessId 1111
+    Assert-True (Test-Path -LiteralPath $OwnedPidPath) 'Remove-LazyPidFileIfOwned must not remove a PID file owned by another process.'
+    Remove-LazyPidFileIfOwned -Path $OwnedPidPath -ProcessId 4242
+    Assert-True (-not (Test-Path -LiteralPath $OwnedPidPath)) 'Remove-LazyPidFileIfOwned must remove a PID file when ownership matches.'
+    Write-LazySupervisorEvent -Path $Paths.SupervisorLogPath -Message 'test-event' -NowProvider { Get-Date '2026-09-08T09:00:00Z' }
+    $SupervisorLog = Get-Content -Raw -LiteralPath $Paths.SupervisorLogPath
+    Assert-True ($SupervisorLog.Contains('2026-09-08T09:00:00.0000000Z test-event')) 'Supervisor logging must persist a timestamped diagnostic event.'
 
     Write-Host 'Checking Read-LazyPidFile handles missing, empty, corrupt and valid content...'
     $PidScratch = New-TrackedLazyTestDirectory
@@ -138,7 +154,7 @@ try {
     $InstallPaths = New-FakeControlPaths $InstallDirectory
     $RegisteredTask = @{ Called = 0 }
     $TaskRegistrar = {
-        param($TaskName, $Execute, $Argument, $WorkingDirectory, $UserId, $RunLevel)
+        param($TaskName, $Execute, $Argument, $WorkingDirectory, $UserId, $RunLevel, $Policy)
         $RegisteredTask.Called += 1
         $RegisteredTask.TaskName = $TaskName
         $RegisteredTask.Execute = $Execute
@@ -146,6 +162,7 @@ try {
         $RegisteredTask.WorkingDirectory = $WorkingDirectory
         $RegisteredTask.UserId = $UserId
         $RegisteredTask.RunLevel = $RunLevel
+        $RegisteredTask.Policy = $Policy
     }.GetNewClosure()
     $InstallResult = Install-LazyControlStack -RepoRoot $RepoRoot -Paths $InstallPaths `
         -ConfigProvider { param($RepoRootArg) $InstallConfig }.GetNewClosure() `
@@ -160,6 +177,14 @@ try {
     Assert-True ($RegisteredTask.Argument -notmatch '-Action') 'Install must invoke the supervisor script directly, not re-enter lazy-control.ps1.'
     Assert-Equal 'Limited' $RegisteredTask.RunLevel 'Install must never request an elevated principal for the logon task.'
     Assert-True (-not [string]::IsNullOrWhiteSpace($RegisteredTask.UserId)) 'Install must scope the task to the current user.'
+    Assert-True $RegisteredTask.Policy.StartWhenAvailable 'Install must persist StartWhenAvailable=true.'
+    Assert-True $RegisteredTask.Policy.AllowStartIfOnBatteries 'Install must allow tunnel startup on battery power.'
+    Assert-True (-not $RegisteredTask.Policy.StopIfGoingOnBatteries) 'Install must not stop the tunnel on battery transition.'
+    Assert-True (-not $RegisteredTask.Policy.StopOnIdleEnd) 'Install must not terminate the long-running tunnel when idle ends.'
+    Assert-Equal ([TimeSpan]::Zero) $RegisteredTask.Policy.ExecutionTimeLimit 'Install must persist an unlimited execution time.'
+    Assert-Equal 'IgnoreNew' $RegisteredTask.Policy.MultipleInstances 'Install must prevent duplicate task instances.'
+    Assert-Equal 10 $RegisteredTask.Policy.RestartCount 'Install must persist the approved restart count.'
+    Assert-Equal ([TimeSpan]::FromMinutes(1)) $RegisteredTask.Policy.RestartInterval 'Install must persist the approved restart interval.'
     Assert-Equal 'DWB Serena Lazy Tunnel' $InstallResult.TaskName 'Install must report the task name it registered.'
 
     Write-Host 'Checking Install-LazyControlStack backs up the existing profile before rendering the lazy profile...'
@@ -314,10 +339,12 @@ try {
     $StatusPaths = New-FakeControlPaths $StatusDirectory
     New-Item -ItemType Directory -Force -Path $StatusPaths.BaseDirectory | Out-Null
     Set-Content -LiteralPath $StatusPaths.TunnelPidPath -Value '7001' -NoNewline
+    Set-Content -LiteralPath $StatusPaths.TunnelClientPidPath -Value '7003' -NoNewline
     Set-Content -LiteralPath $StatusPaths.ProxyPidPath -Value '7002' -NoNewline
     $TunnelInfo = [pscustomobject]@{ Id = 7001; ExecutablePath = $RealPowerShellPath; CommandLine = "-File `"$FakeSupervisorPath`"" }
+    $TunnelClientInfo = [pscustomobject]@{ Id = 7003; ExecutablePath = $StatusConfig.TunnelClientPath; CommandLine = 'tunnel-client.exe run --profile dwb-serena' }
     $ProxyInfo = [pscustomobject]@{ Id = 7002; ExecutablePath = $StatusConfig.NodePath; CommandLine = $StatusConfig.ProxyCommand }
-    $InspectorMap = @{ 7001 = $TunnelInfo; 7002 = $ProxyInfo }
+    $InspectorMap = @{ 7001 = $TunnelInfo; 7002 = $ProxyInfo; 7003 = $TunnelClientInfo }
     $FakeInspector = { param($ProcessId) if ($InspectorMap.ContainsKey($ProcessId)) { $InspectorMap[$ProcessId] } else { $null } }.GetNewClosure()
     $FakeStatusJson = [pscustomobject]@{
         proxy = 'ready'; serena = 'idle'; pid = $null; inFlight = 0; queued = 0
@@ -329,8 +356,10 @@ try {
         -ProcessInspector $FakeInspector `
         -StatusHttpGetter { param($Url) $FakeStatusJson }.GetNewClosure()
 
-    Assert-Equal 7001 $StatusResult.TunnelPid 'Status must report the tunnel PID from its PID file.'
-    Assert-True $StatusResult.TunnelVerified 'Status must report the tunnel PID as verified when it matches.'
+    Assert-Equal 7001 $StatusResult.TunnelPid 'Status must report the supervisor PID from its PID file.'
+    Assert-True $StatusResult.TunnelVerified 'Status must report the supervisor PID as verified when it matches.'
+    Assert-Equal 7003 $StatusResult.TunnelClientPid 'Status must report the persisted tunnel-client PID.'
+    Assert-True $StatusResult.TunnelClientVerified 'Status must verify the persisted tunnel-client PID against executable and command line.'
     Assert-Equal 7002 $StatusResult.ProxyPid 'Status must report the proxy PID from its PID file.'
     Assert-True $StatusResult.ProxyVerified 'Status must report the proxy PID as verified when it matches.'
     Assert-Equal 'http://127.0.0.1:18012/status' $StatusResult.StatusUrl 'Status must expose the exact proxy status URL.'
@@ -380,7 +409,7 @@ try {
     Assert-Equal 0 $StopCalls.Force 'A missing PID file must never trigger a forced stop attempt.'
     Assert-True (-not $MissingResult.TunnelStopped) 'With no PID file, TunnelStopped must be false.'
     Assert-True (-not $MissingResult.ProxyStopped) 'With no PID file, ProxyStopped must be false.'
-    Assert-True ($MissingResult.SkippedStale.Count -eq 2) 'Both missing PID files must be recorded as skipped.'
+    Assert-True ($MissingResult.SkippedStale.Count -eq 3) 'Missing supervisor, tunnel-client, and proxy PID state must each be recorded as skipped.'
 
     Write-Host 'Checking Stop-LazyControlStack: a stale PID whose process no longer exists is never force-killed...'
     $StopGoneDirectory = New-TrackedLazyTestDirectory
@@ -398,6 +427,35 @@ try {
         -Sleeper { param($Milliseconds) } -NowProvider { Get-Date }
     Assert-Equal 0 $GoneStopCalls.Graceful 'A PID file pointing at a process that no longer exists must never trigger a graceful stop.'
     Assert-Equal 0 $GoneStopCalls.Force 'A PID file pointing at a process that no longer exists must never be force-killed.'
+
+    Write-Host 'Checking Stop-LazyControlStack: a dead supervisor with a verified persisted tunnel-client PID can safely stop the orphan client...'
+    $OrphanDirectory = New-TrackedLazyTestDirectory
+    $OrphanDestination = Join-Path $OrphanDirectory 'rendered.yaml'
+    $OrphanConfig = New-FakeRuntimeConfig -Directory $OrphanDirectory -DestinationPath $OrphanDestination
+    $OrphanPaths = New-FakeControlPaths $OrphanDirectory
+    New-Item -ItemType Directory -Force -Path $OrphanPaths.BaseDirectory | Out-Null
+    Set-Content -LiteralPath $OrphanPaths.TunnelPidPath -Value '6201' -NoNewline
+    Set-Content -LiteralPath $OrphanPaths.TunnelClientPidPath -Value '6202' -NoNewline
+    $OrphanClientInfo = [pscustomobject]@{ Id = 6202; ExecutablePath = $OrphanConfig.TunnelClientPath; CommandLine = 'tunnel-client.exe run --profile dwb-serena' }
+    $OrphanState = @{ ClientAlive = $true; GracefulCalls = 0; ForceCalls = 0 }
+    $OrphanInspector = {
+        param($ProcessId)
+        if ($ProcessId -eq 6201) { return $null }
+        if ($ProcessId -eq 6202 -and $OrphanState.ClientAlive) { return $OrphanClientInfo }
+        return $null
+    }.GetNewClosure()
+    $OrphanResult = Stop-LazyControlStack -RepoRoot $RepoRoot -Paths $OrphanPaths `
+        -ConfigProvider { param($RepoRootArg) $OrphanConfig }.GetNewClosure() `
+        -ProcessInspector $OrphanInspector -ProcessEnumerator { , @() }.GetNewClosure() `
+        -GracefulStopper { param($ProcessId) $OrphanState.GracefulCalls += 1; if ($ProcessId -eq 6202) { $OrphanState.ClientAlive = $false } }.GetNewClosure() `
+        -ForceStopper { param($ProcessId) $OrphanState.ForceCalls += 1 }.GetNewClosure() `
+        -GracefulTimeoutMs 2000 -PollIntervalMs 100 `
+        -Sleeper { param($Milliseconds) } -NowProvider { Get-Date }
+    Assert-Equal 1 $OrphanState.GracefulCalls 'A verified orphan tunnel-client must receive exactly one graceful stop request.'
+    Assert-Equal 0 $OrphanState.ForceCalls 'An orphan tunnel-client that exits gracefully must never be force-killed.'
+    Assert-True $OrphanResult.TunnelStopped 'Stopping the verified persisted orphan client must satisfy the tunnel stop result.'
+    Assert-True (-not (Test-Path -LiteralPath $OrphanPaths.TunnelClientPidPath)) 'The tunnel-client PID file must be removed after the verified orphan stops.'
+    Assert-True (-not (Test-Path -LiteralPath $OrphanPaths.TunnelPidPath)) 'A stale supervisor PID file must be removed once the supervisor is confirmed gone and its orphan client is stopped.'
 
     Write-Host 'Checking Stop-LazyControlStack: a PID file whose process identity does not match is never stopped (unrelated-process safety)...'
     $StopWrongDirectory = New-TrackedLazyTestDirectory

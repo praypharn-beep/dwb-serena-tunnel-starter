@@ -13,13 +13,7 @@ function Get-LazyControlPaths {
     param(
         [string]$AppDataRoot = $env:APPDATA
     )
-    $Base = Join-Path $AppDataRoot 'tunnel-client'
-    return [pscustomobject]@{
-        BaseDirectory   = $Base
-        TunnelPidPath   = Join-Path $Base 'dwb-serena-tunnel.pid'
-        ProxyPidPath    = Join-Path $Base 'dwb-serena-proxy.pid'
-        BackupDirectory = Join-Path $Base 'backups'
-    }
+    return Get-LazyRuntimeStatePaths -AppDataRoot $AppDataRoot
 }
 
 function Get-LazySupervisorPath {
@@ -96,11 +90,15 @@ function Install-LazyControlStack {
         [pscustomobject]$Paths,
         [scriptblock]$ConfigProvider = { param($RepoRootArg) Get-LazyRuntimeConfig -RepoRoot $RepoRootArg },
         [scriptblock]$TaskRegistrar = {
-            param($TaskNameArg, $Execute, $Argument, $WorkingDirectory, $UserId, $RunLevel)
+            param($TaskNameArg, $Execute, $Argument, $WorkingDirectory, $UserId, $RunLevel, $Policy)
             $TaskAction = New-ScheduledTaskAction -Execute $Execute -Argument $Argument -WorkingDirectory $WorkingDirectory
             $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
             $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel $RunLevel
-            Register-ScheduledTask -TaskName $TaskNameArg -Action $TaskAction -Trigger $Trigger -Principal $Principal -Force | Out-Null
+            $TaskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+                -DontStopIfGoingOnBatteries -DontStopOnIdleEnd `
+                -ExecutionTimeLimit $Policy.ExecutionTimeLimit -MultipleInstances $Policy.MultipleInstances `
+                -RestartCount $Policy.RestartCount -RestartInterval $Policy.RestartInterval
+            Register-ScheduledTask -TaskName $TaskNameArg -Action $TaskAction -Trigger $Trigger -Principal $Principal -Settings $TaskSettings -Force | Out-Null
         },
         [scriptblock]$NowProvider = { [DateTime]::UtcNow }
     )
@@ -123,8 +121,18 @@ function Install-LazyControlStack {
     $PowerShellPath = (Get-Command powershell.exe).Source
     $Argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SupervisorPath`""
     $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $TaskPolicy = [pscustomobject]@{
+        StartWhenAvailable         = $true
+        AllowStartIfOnBatteries    = $true
+        StopIfGoingOnBatteries     = $false
+        StopOnIdleEnd              = $false
+        ExecutionTimeLimit         = [TimeSpan]::Zero
+        MultipleInstances          = 'IgnoreNew'
+        RestartCount               = 10
+        RestartInterval            = [TimeSpan]::FromMinutes(1)
+    }
 
-    & $TaskRegistrar $TaskName $PowerShellPath $Argument $RepoRoot $UserId 'Limited'
+    & $TaskRegistrar $TaskName $PowerShellPath $Argument $RepoRoot $UserId 'Limited' $TaskPolicy
 
     return [pscustomobject]@{
         TaskName       = $TaskName
@@ -231,6 +239,13 @@ function Get-LazyControlStatus {
         $TunnelVerified = Confirm-LazyProcessMatch -ProcessInfo $TunnelInfo -ExpectedExecutablePath $PowerShellPath -RequiredCommandLineSubstrings @($SupervisorPath)
     }
 
+    $TunnelClientPid = Read-LazyPidFile -Path $Paths.TunnelClientPidPath
+    $TunnelClientVerified = $false
+    if ($TunnelClientPid) {
+        $TunnelClientInfo = & $ProcessInspector $TunnelClientPid
+        $TunnelClientVerified = Confirm-LazyProcessMatch -ProcessInfo $TunnelClientInfo -ExpectedExecutablePath $Config.TunnelClientPath -RequiredCommandLineSubstrings @('run --profile dwb-serena')
+    }
+
     $ProxyPid = Read-LazyPidFile -Path $Paths.ProxyPidPath
     $ProxyVerified = $false
     if ($ProxyPid) {
@@ -249,8 +264,10 @@ function Get-LazyControlStatus {
     }
 
     return [pscustomobject]@{
-        TunnelPid          = $TunnelPid
+        TunnelPid           = $TunnelPid
         TunnelVerified      = $TunnelVerified
+        TunnelClientPid     = $TunnelClientPid
+        TunnelClientVerified = $TunnelClientVerified
         ProxyPid            = $ProxyPid
         ProxyVerified        = $ProxyVerified
         StatusUrl           = $StatusUrl
@@ -268,7 +285,8 @@ function Format-LazyControlStatus {
     param([Parameter(Mandatory)] $Status)
     $Lines = @(
         'DWB Serena Lazy Tunnel - status'
-        "Tunnel process : $(if ($Status.TunnelVerified) { "PID $($Status.TunnelPid) (verified)" } elseif ($Status.TunnelPid) { "PID $($Status.TunnelPid) (NOT verified - ignored)" } else { 'not running' })"
+        "Supervisor     : $(if ($Status.TunnelVerified) { "PID $($Status.TunnelPid) (verified)" } elseif ($Status.TunnelPid) { "PID $($Status.TunnelPid) (NOT verified - ignored)" } else { 'not running' })"
+        "Tunnel client  : $(if ($Status.TunnelClientVerified) { "PID $($Status.TunnelClientPid) (verified)" } elseif ($Status.TunnelClientPid) { "PID $($Status.TunnelClientPid) (NOT verified - ignored)" } else { 'not running' })"
         "Proxy process  : $(if ($Status.ProxyVerified) { "PID $($Status.ProxyPid) (verified)" } elseif ($Status.ProxyPid) { "PID $($Status.ProxyPid) (NOT verified - ignored)" } else { 'not running' })"
         "Tunnel health  : $($Status.HealthUrl)"
         "Proxy status   : $($Status.StatusUrl)"
@@ -425,12 +443,11 @@ function Stop-LazyControlStack {
     # ever sent. A PID file that is missing, unparsable, points at a process that no longer exists,
     # or points at a process whose identity does not match is left completely untouched.
     #
-    # The "Tunnel" umbrella covers TWO independently-verified process identities, not one: the
-    # hidden PowerShell supervisor (recorded in dwb-serena-tunnel.pid) AND its tunnel-client.exe
-    # child (discovered live via ProcessEnumerator, never persisted to its own PID file - see
-    # Stop-LazySupervisedProcessTree). Windows does not cascade-kill a process's children when the
-    # parent is terminated, so stopping only the supervisor would silently orphan a still-listening
-    # tunnel-client.exe.
+    # The "Tunnel" umbrella covers the hidden PowerShell supervisor and its tunnel-client.exe
+    # child. The supervisor PID and tunnel-client PID are persisted separately so an externally
+    # terminated supervisor cannot make a still-listening orphan tunnel impossible to identify and
+    # stop safely. When the supervisor is alive we still stop it first to prevent its restart loop
+    # from immediately relaunching the client.
     param(
         [Parameter(Mandatory)] [string]$RepoRoot,
         [pscustomobject]$Paths,
@@ -461,8 +478,9 @@ function Stop-LazyControlStack {
 
     # --- Tunnel: supervisor + its tunnel-client.exe child ---
     $SupervisorPid = Read-LazyPidFile -Path $Paths.TunnelPidPath
+    $SupervisorAttempted = $false
     if (-not $SupervisorPid) {
-        $Result.SkippedStale.Add('Tunnel: no valid PID file found; nothing to stop.')
+        $Result.SkippedStale.Add('Supervisor: no valid PID file found; checking persisted tunnel-client PID.')
     }
     else {
         $TreeResult = Stop-LazySupervisedProcessTree -ParentProcessId $SupervisorPid `
@@ -473,9 +491,10 @@ function Stop-LazyControlStack {
             -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
 
         if (-not $TreeResult.ParentAttempted) {
-            $Result.SkippedStale.Add("Tunnel: PID $SupervisorPid did not match the expected supervisor process; left untouched.")
+            $Result.SkippedStale.Add("Supervisor: PID $SupervisorPid did not match the expected supervisor process; checking persisted tunnel-client PID.")
         }
         else {
+            $SupervisorAttempted = $true
             $ChildOk = (-not $TreeResult.ChildPid) -or $TreeResult.ChildStopped
             $Result.TunnelStopped = $TreeResult.ParentStopped -and $ChildOk
 
@@ -488,6 +507,32 @@ function Stop-LazyControlStack {
 
             if ($TreeResult.ChildPid -and -not $TreeResult.ChildStopped) {
                 $Result.SkippedStale.Add("Tunnel: tunnel-client.exe (PID $($TreeResult.ChildPid)) could not be confirmed stopped.")
+            }
+        }
+    }
+
+    if (-not $SupervisorAttempted -and -not $Result.TunnelStopped) {
+        $TunnelClientPid = Read-LazyPidFile -Path $Paths.TunnelClientPidPath
+        if (-not $TunnelClientPid) {
+            $Result.SkippedStale.Add('Tunnel client: no valid PID file found; nothing further to stop.')
+        }
+        else {
+            $ClientOutcome = Stop-LazyVerifiedTarget -ProcessId $TunnelClientPid `
+                -ExpectedExecutablePath $Config.TunnelClientPath -RequiredCommandLineSubstrings @('run --profile dwb-serena') `
+                -ProcessInspector $ProcessInspector -GracefulStopper $GracefulStopper -ForceStopper $ForceStopper `
+                -GracefulTimeoutMs $GracefulTimeoutMs -PollIntervalMs $PollIntervalMs -Sleeper $Sleeper -NowProvider $NowProvider
+            if (-not $ClientOutcome.Attempted) {
+                $Result.SkippedStale.Add("Tunnel client: PID $TunnelClientPid did not match the expected managed process; left untouched.")
+            }
+            elseif ($ClientOutcome.Stopped) {
+                $Result.TunnelStopped = $true
+                Remove-Item -LiteralPath $Paths.TunnelClientPidPath -Force -ErrorAction SilentlyContinue
+                if ($SupervisorPid -and -not (& $ProcessInspector $SupervisorPid)) {
+                    Remove-Item -LiteralPath $Paths.TunnelPidPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            else {
+                $Result.SkippedStale.Add("Tunnel client: PID $TunnelClientPid could not be confirmed stopped; PID file left in place.")
             }
         }
     }
