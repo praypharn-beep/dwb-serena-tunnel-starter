@@ -84,6 +84,15 @@ Assert-True ($LazyControlContent.Contains('Confirm-LazyProcessMatch')) 'scripts\
 Assert-True ($LazyControlContent.Contains("'DWB Serena Lazy Tunnel'")) 'scripts\lazy-control.ps1 must use the exact approved Scheduled Task name.'
 Assert-True ($LazyControlContent.Contains('-RunLevel')) 'scripts\lazy-control.ps1 must explicitly set the Scheduled Task principal run level (never implicitly elevated).'
 Assert-True ($LazyControlContent -notmatch "RunLevel\s+'?Highest'?") 'scripts\lazy-control.ps1 must never register the logon task with an elevated (Highest) run level.'
+Assert-True ($LazyControlContent.Contains('-DontStopOnIdleEnd')) 'The installed task must explicitly disable idle-end termination for the long-running tunnel.'
+Assert-True ($LazyControlContent.Contains('-RestartCount')) 'The installed task must persist a restart-on-failure policy.'
+Assert-True ($LazyControlContent.Contains('TunnelClientPidPath')) 'The control layer must track the tunnel-client PID separately from the supervisor PID.'
+
+$LazySupervisorContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'scripts\lazy-supervisor.ps1')
+Assert-True ($LazySupervisorContent.Contains('Set-LazyPidFile -Path $StatePaths.TunnelPidPath -ProcessId $PID')) 'The Scheduled Task supervisor must own and refresh its supervisor PID file directly.'
+Assert-True ($LazySupervisorContent.Contains('TunnelClientPidPath')) 'The supervisor must persist the child tunnel-client PID so an orphan remains controllable.'
+Assert-True ($LazySupervisorContent.Contains('Write-LazySupervisorEvent')) 'The supervisor must emit persistent lifecycle diagnostics.'
+Assert-True ($LazyCommonContent.Contains('restart-backoff')) 'The launcher must emit restart-backoff diagnostics and avoid a tight restart loop.'
 
 $LazyControlCmdContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'Lazy-Control.cmd')
 Assert-True ($LazyControlCmdContent.Contains('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lazy-control.ps1" -Action "%~1"')) 'Lazy-Control.cmd must delegate to scripts\lazy-control.ps1 using the exact specified command line.'

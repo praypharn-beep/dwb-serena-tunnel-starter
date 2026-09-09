@@ -49,11 +49,14 @@ if ($SerenaExitCode -ne 0) {
 if ([string]::IsNullOrWhiteSpace($TunnelId) -or $TunnelId -cnotmatch '^tunnel_[0-9a-f]{32}$') {
     Fail 'Tunnel ID is missing or invalid. Run Configure.cmd again.'
 }
+if ([string]::IsNullOrWhiteSpace($OrganizationId) -or $OrganizationId -cnotmatch '^org-[A-Za-z0-9]{20,}$') {
+    Fail 'Organization ID is missing or invalid. Run Configure.cmd again.'
+}
 
 . (Join-Path $Root 'scripts\lazy-common.ps1')
 
 try {
-    $Config = Get-LazyRuntimeConfig -RepoRoot $Root -TunnelIdOverride $TunnelId
+    $Config = Get-LazyRuntimeConfig -RepoRoot $Root -TunnelIdOverride $TunnelId -OrganizationIdOverride $OrganizationId
 }
 catch {
     Fail "Lazy proxy is not ready: $($_.Exception.Message)"
@@ -93,6 +96,7 @@ catch {
     Fail "Could not decrypt the API key for preflight: $($_.Exception.Message)"
 }
 $env:CONTROL_PLANE_API_KEY = $PreflightApiKey
+$env:CONTROL_PLANE_ORGANIZATION_ID = $Config.OrganizationId
 $PreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
@@ -103,6 +107,7 @@ finally {
     $ErrorActionPreference = $PreviousErrorActionPreference
     $PreflightApiKey = $null
     $env:CONTROL_PLANE_API_KEY = $null
+    $env:CONTROL_PLANE_ORGANIZATION_ID = $null
 }
 Write-Host ($DoctorOutput -join "`n")
 if ($DoctorExitCode -ne 0) {

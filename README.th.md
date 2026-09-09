@@ -155,6 +155,8 @@ Lazy-Control.cmd uninstall   ถอด logon task, หยุดการทำ�
 รายละเอียด:
 
 - Logon task ชื่อ **`DWB Serena Lazy Tunnel`** ทำงานเมื่อผู้ใช้ Windows คนปัจจุบัน logon (`AtLogOn`) เท่านั้น เปิดหน้าต่าง PowerShell แบบ **ซ่อน** และลงทะเบียนด้วยสิทธิ์ **ไม่ยกระดับ (Limited)** — ไม่ขอสิทธิ์ผู้ดูแลระบบเด็ดขาด
+- `install` จะบันทึกค่าความทนทานของ tunnel ระยะยาวไว้กับ task โดยตรง: `StartWhenAvailable`, restart เมื่อ fail 10 ครั้งห่างกันครั้งละ 1 นาที, ไม่จำกัดเวลารัน, `IgnoreNew` เพื่อกัน task ซ้อน, ไม่หยุดเมื่อเปลี่ยนไปใช้แบตเตอรี่ และไม่ terminate เมื่อ idle สิ้นสุด
+- supervisor จะบันทึก PID ของตัวเอง, PID ของ `tunnel-client.exe`, PID ของ lazy proxy และ lifecycle log แบบจำกัดขนาดไว้ใต้ `%APPDATA%\tunnel-client\` ทำให้ยังระบุตัว orphan client ได้แม้ supervisor ถูก terminate จากภายนอก
 - `install` และ `start` render tunnel profile จาก template เดียวกับที่ `Start.cmd` ใช้ ดังนั้น profile จะชี้ไปที่ lazy proxy เสมอ ไม่ใช่ Serena โดยตรง
 - `install` จะ **สำรอง (backup) tunnel profile ปัจจุบันก่อนเสมอ** ไปที่ `%APPDATA%\tunnel-client\backups\dwb-serena.<UTC timestamp>.yaml` (เช่น `dwb-serena.20260821T100000Z.yaml`) ก่อนเขียนทับ
 - `stop` และ `uninstall` จะ **ตรวจ executable path และ command line** ของ process ที่จะหยุดก่อนส่งสัญญาณใด ๆ และตรวจซ้ำอีกครั้งก่อน force-kill เสมอ PID ที่หายไป ค้าง หรือถูกใช้ซ้ำโดย process อื่นจะถูกปล่อยไว้เฉย ๆ ไม่ถูกแตะต้อง ดูรายละเอียดที่ [SECURITY.md](SECURITY.md)

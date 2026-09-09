@@ -4,6 +4,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $RepoRoot 'scripts\lazy-common.ps1')
 
 $FakeTunnelId = 'tunnel_0123456789abcdef0123456789abcdef'
+$FakeOrganizationId = 'org-aaaaaaaaaaaaaaaaaaaaaaaa'
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
@@ -125,8 +126,17 @@ mcp:
     Assert-True $ThrewOnNewline 'A value containing a newline must be rejected rather than unsafely embedded.'
 
     Write-Host 'Checking the runtime config and rendered command...'
-    $Config = Get-LazyRuntimeConfig -RepoRoot $RepoRoot -TunnelIdOverride $FakeTunnelId
+    $Config = Get-LazyRuntimeConfig -RepoRoot $RepoRoot -TunnelIdOverride $FakeTunnelId -OrganizationIdOverride $FakeOrganizationId
     Assert-True ($Config.TunnelId -eq $FakeTunnelId) 'Get-LazyRuntimeConfig must honor an explicit tunnel ID override.'
+    Assert-True ($Config.OrganizationId -eq $FakeOrganizationId) 'Runtime config must return the validated Organization ID.'
+    $InvalidOrganizationRejected = $false
+    try {
+        Get-LazyRuntimeConfig -RepoRoot $RepoRoot -TunnelIdOverride $FakeTunnelId -OrganizationIdOverride 'not-an-org-id' | Out-Null
+    }
+    catch {
+        $InvalidOrganizationRejected = $true
+    }
+    Assert-True $InvalidOrganizationRejected 'Runtime config must reject a malformed Organization ID before launch.'
     Assert-True ($Config.ManifestPath -eq (Join-Path $RepoRoot 'lazy-proxy\serena-tools.json')) 'Get-LazyRuntimeConfig must resolve the Task 4 manifest path exactly.'
     Assert-True (Test-Path $Config.ManifestPath) 'The resolved manifest path must exist.'
     Assert-True ($Config.IdleTimeoutMs -eq 900000) 'The approved idle timeout is 900000 ms.'
@@ -177,6 +187,7 @@ mcp:
         Set-Content -LiteralPath $DoctorTemplatePath -Encoding utf8 -Value $DoctorTemplate
         Write-LazyTunnelProfile -TemplatePath $DoctorTemplatePath -DestinationPath $DoctorProfilePath -TunnelId $FakeTunnelId -ProxyCommand $Command | Out-Null
         Write-Host "Doctor integration health port: $DoctorHealthAddress"
+
         $PreviousControlPlaneApiKey = $env:CONTROL_PLANE_API_KEY
         $env:CONTROL_PLANE_API_KEY = 'test-only-doctor-key'
         try {
@@ -204,6 +215,74 @@ mcp:
     $ConfigDump = ($Config | Format-List | Out-String)
     Assert-True (-not $ConfigDump.Contains($PlaintextSecret)) 'Get-LazyRuntimeConfig output must never contain decrypted API key plaintext.'
 
+    Write-Host 'Checking DPAPI decrypt survives an incompatible security module earlier in a fresh Windows PowerShell child...'
+    $ShadowDirectory = New-TrackedLazyTestDirectory
+    $ShadowModuleRoot = Join-Path $ShadowDirectory 'modules'
+    $ShadowVersionDirectory = Join-Path $ShadowModuleRoot 'Microsoft.PowerShell.Security\99.0.0'
+    New-Item -ItemType Directory -Path $ShadowVersionDirectory -Force | Out-Null
+    $ShadowManifestPath = Join-Path $ShadowVersionDirectory 'Microsoft.PowerShell.Security.psd1'
+    $ShadowModulePath = Join-Path $ShadowVersionDirectory 'Microsoft.PowerShell.Security.psm1'
+    Set-Content -LiteralPath $ShadowManifestPath -Encoding utf8 -Value @'
+@{
+    RootModule = 'Microsoft.PowerShell.Security.psm1'
+    ModuleVersion = '99.0.0'
+    GUID = '11111111-2222-3333-4444-555555555555'
+    FunctionsToExport = @('ConvertTo-SecureString')
+    CmdletsToExport = @()
+    VariablesToExport = @()
+    AliasesToExport = @()
+}
+'@
+    Set-Content -LiteralPath $ShadowModulePath -Encoding utf8 -Value '# Deliberately advertises but does not provide ConvertTo-SecureString.'
+
+    $ShadowSecureValue = New-Object System.Security.SecureString
+    foreach ($CharacterCode in @(115, 121, 110, 116, 104, 101, 116, 105, 99)) {
+        $ShadowSecureValue.AppendChar([char]$CharacterCode)
+    }
+    $ShadowSecretPath = Join-Path $ShadowDirectory 'synthetic.dpapi'
+    (ConvertFrom-SecureString -SecureString $ShadowSecureValue) | Set-Content -LiteralPath $ShadowSecretPath -Encoding ascii
+    $ShadowSecureValue.Dispose()
+
+    $ChildScriptPath = Join-Path $ShadowDirectory 'decrypt-child.ps1'
+    $ChildStdoutPath = Join-Path $ShadowDirectory 'decrypt-child.stdout.txt'
+    $ChildStderrPath = Join-Path $ShadowDirectory 'decrypt-child.stderr.txt'
+    $EscapedCommonPath = (Join-Path $RepoRoot 'scripts\lazy-common.ps1').Replace("'", "''")
+    $EscapedSecretPath = $ShadowSecretPath.Replace("'", "''")
+    $ChildScript = @'
+$ErrorActionPreference = 'Stop'
+. '__COMMON_PATH__'
+try {
+    $Decrypted = Get-DpapiApiKey -SecretPath '__SECRET_PATH__'
+    if ([string]::IsNullOrWhiteSpace($Decrypted)) { exit 21 }
+    $Decrypted = $null
+    [Console]::Out.WriteLine('SUCCESS')
+    exit 0
+}
+catch {
+    [Console]::Error.WriteLine($_.FullyQualifiedErrorId)
+    exit 22
+}
+'@
+    $ChildScript = $ChildScript.Replace('__COMMON_PATH__', $EscapedCommonPath).Replace('__SECRET_PATH__', $EscapedSecretPath)
+    Set-Content -LiteralPath $ChildScriptPath -Encoding utf8 -Value $ChildScript
+
+    $PreviousPSModulePath = $env:PSModulePath
+    try {
+        $env:PSModulePath = $ShadowModuleRoot + [System.IO.Path]::PathSeparator + $PreviousPSModulePath
+        $ChildProcess = Start-Process -FilePath (Get-Command powershell.exe).Source `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$ChildScriptPath`"") `
+            -RedirectStandardOutput $ChildStdoutPath -RedirectStandardError $ChildStderrPath `
+            -WindowStyle Hidden -Wait -PassThru
+    }
+    finally {
+        $env:PSModulePath = $PreviousPSModulePath
+    }
+    $ChildStdout = Get-Content -Raw -LiteralPath $ChildStdoutPath -ErrorAction SilentlyContinue
+    $ChildStderr = Get-Content -Raw -LiteralPath $ChildStderrPath -ErrorAction SilentlyContinue
+    Assert-True ($ChildProcess.ExitCode -eq 0) "A fresh Windows PowerShell child must decrypt a synthetic DPAPI value even when PSModulePath starts with an incompatible Microsoft.PowerShell.Security module. Exit: $($ChildProcess.ExitCode); stderr: $ChildStderr"
+    Assert-True ($ChildStdout.Trim() -eq 'SUCCESS') 'The child must report success without printing the decrypted synthetic value.'
+    Assert-True ([string]::IsNullOrWhiteSpace($ChildStderr)) 'The successful child must not emit an error or decrypted value to stderr.'
+
     Write-Host 'Checking the bounded restart policy...'
     $FakeConfig = [pscustomobject]@{
         RepoRoot               = $RepoRoot
@@ -212,6 +291,7 @@ mcp:
         ProfileTemplatePath    = $TemplatePath
         ProfileDestinationPath = Join-Path (New-TrackedLazyTestDirectory) 'rendered-supervisor.yaml'
         TunnelId                = $FakeTunnelId
+        OrganizationId          = $FakeOrganizationId
         ProxyCommand            = $FakeProxyCommand
         IdleTimeoutMs           = 900000
         StartupTimeoutMs        = 30000
@@ -222,13 +302,14 @@ mcp:
     # to a $script:-scoped scalar from inside a closure do not propagate back to the caller. A
     # Hashtable is a reference type, so the captured reference still points at the same shared
     # object and mutations to its entries are visible everywhere.
-    $RestartState = @{ LaunchCount = 0; FakeNow = Get-Date '2026-08-21T09:00:00' }
+    $RestartState = @{ LaunchCount = 0; FakeNow = Get-Date '2026-08-21T09:00:00'; Sleeps = New-Object System.Collections.Generic.List[int] }
     $NowProvider = { $RestartState.FakeNow }.GetNewClosure()
     $ProcessLauncher = {
         param($FilePath, $ArgumentList, $WorkingDirectory)
         $RestartState.LaunchCount += 1
         $RestartState.FakeNow = $RestartState.FakeNow.AddMinutes(1)
         [pscustomobject]@{
+            Id = 4321
             ExitCode = 1
         } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
     }.GetNewClosure()
@@ -238,6 +319,7 @@ mcp:
         Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 `
             -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
             -ProcessLauncher $ProcessLauncher `
+            -Sleeper { param($Seconds) $RestartState.Sleeps.Add([int]$Seconds) }.GetNewClosure() `
             -NowProvider $NowProvider | Out-Null
     }
     catch {
@@ -245,15 +327,26 @@ mcp:
     }
     Assert-True $BoundExceeded 'Start-LazyTunnel must stop supervising once the restart bound is exceeded.'
     Assert-True ($RestartState.LaunchCount -eq 3) "Start-LazyTunnel must allow exactly 3 starts within the 10 minute window before stopping, launched $($RestartState.LaunchCount) times."
+    Assert-True ((($RestartState.Sleeps.ToArray()) -join ',') -eq '5,10') 'Restart backoff must grow 5s -> 10s between retry attempts and must not sleep after the final allowed start.'
 
-    Write-Host 'Checking -Once disables restart...'
+    Write-Host 'Checking -Once disables restart and lifecycle callbacks are emitted...'
     $RestartState.LaunchCount = 0
     $RestartState.FakeNow = Get-Date '2026-08-21T09:00:00'
+    $Lifecycle = @{ Started = 0; Exited = 0; StartedPid = $null; ExitCode = $null; Logs = New-Object System.Collections.Generic.List[string] }
     Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 -Once `
         -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
         -ProcessLauncher $ProcessLauncher `
+        -ProcessStarted { param($Process, $ConfigArg) $Lifecycle.Started += 1; $Lifecycle.StartedPid = $Process.Id }.GetNewClosure() `
+        -ProcessExited { param($Process, $ExitCodeArg, $ConfigArg) $Lifecycle.Exited += 1; $Lifecycle.ExitCode = $ExitCodeArg }.GetNewClosure() `
+        -EventLogger { param($Message) $Lifecycle.Logs.Add([string]$Message) }.GetNewClosure() `
         -NowProvider $NowProvider | Out-Null
     Assert-True ($RestartState.LaunchCount -eq 1) '-Once must make exactly one start attempt and then return.'
+    Assert-True ($Lifecycle.Started -eq 1) 'Start-LazyTunnel must invoke ProcessStarted once for a launched child.'
+    Assert-True ($Lifecycle.StartedPid -eq 4321) 'ProcessStarted must receive the launched child PID.'
+    Assert-True ($Lifecycle.Exited -eq 1) 'Start-LazyTunnel must invoke ProcessExited once after the child exits.'
+    Assert-True ($Lifecycle.ExitCode -eq 1) 'ProcessExited must receive the child exit code.'
+    Assert-True (($Lifecycle.Logs -join "`n") -match 'tunnel-client-started pid=4321') 'EventLogger must receive a sanitized child-start event.'
+    Assert-True (($Lifecycle.Logs -join "`n") -match 'tunnel-client-exited pid=4321 code=1') 'EventLogger must receive a sanitized child-exit event.'
 
     Write-Host 'Checking the sliding restart window expires old events...'
     $RestartState.LaunchCount = 0
@@ -280,6 +373,7 @@ mcp:
         Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 `
             -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
             -ProcessLauncher $WindowLauncher `
+            -Sleeper { param($Seconds) } `
             -NowProvider $WindowNowProvider | Out-Null
     }
     catch {
@@ -331,12 +425,16 @@ mcp:
 
     Write-Host 'Checking CONTROL_PLANE_API_KEY is populated during launch and cleared afterward...'
     Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)) 'Test precondition failed: CONTROL_PLANE_API_KEY must not already be set in this process before this check runs.'
+    Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)) 'Organization environment precondition must be empty.'
 
     $ObservedApiKey = @{ WasSet = $false; Value = $null }
+    $ObservedOrganization = @{ WasSet = $false; Value = $null }
     $ApiKeyObservingLauncher = {
         param($FilePath, $ArgumentList, $WorkingDirectory)
         $ObservedApiKey.WasSet = -not [string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)
         $ObservedApiKey.Value = $env:CONTROL_PLANE_API_KEY
+        $ObservedOrganization.WasSet = -not [string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)
+        $ObservedOrganization.Value = $env:CONTROL_PLANE_ORGANIZATION_ID
         [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
     }.GetNewClosure()
     Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 1 -RestartWindowMinutes 10 -Once `
@@ -350,6 +448,9 @@ mcp:
     Assert-True $ObservedApiKey.WasSet 'CONTROL_PLANE_API_KEY must actually be populated in the environment at the moment the tunnel process is launched.'
     Assert-True ($ObservedApiKey.Value -eq $DecryptedSecret) 'The environment variable observed during launch must equal the real decrypted API key, not a placeholder.'
     Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)) 'CONTROL_PLANE_API_KEY must be cleared from the environment after Start-LazyTunnel returns on the success path.'
+    Assert-True $ObservedOrganization.WasSet 'Organization context must exist when the child launches.'
+    Assert-True ($ObservedOrganization.Value -eq $FakeOrganizationId) 'The child must receive the configured Organization ID.'
+    Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)) 'Organization context must clear after success.'
 
     Write-Host 'Checking CONTROL_PLANE_API_KEY is cleared even when the launcher throws...'
     $ThrowingLauncher = {
@@ -361,6 +462,7 @@ mcp:
         -ProcessLauncher $ThrowingLauncher `
         -NowProvider { Get-Date } | Out-Null
     Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_API_KEY)) 'CONTROL_PLANE_API_KEY must be cleared from the environment even when the launcher throws.'
+    Assert-True ([string]::IsNullOrEmpty($env:CONTROL_PLANE_ORGANIZATION_ID)) 'Organization context must clear after failure.'
 
     Write-Host 'All lazy launcher checks passed.' -ForegroundColor Green
 }

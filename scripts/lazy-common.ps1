@@ -23,7 +23,8 @@ function ConvertTo-LazyQuotedArgument {
 function Get-LazyRuntimeConfig {
     param(
         [Parameter(Mandatory)] [string]$RepoRoot,
-        [string]$TunnelIdOverride
+        [string]$TunnelIdOverride,
+        [string]$OrganizationIdOverride
     )
 
     $NodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -41,13 +42,17 @@ function Get-LazyRuntimeConfig {
     if (-not (Test-Path -LiteralPath $ManifestPath)) { throw "Serena tool manifest not found: $ManifestPath" }
 
     $TunnelId = $TunnelIdOverride
-    if ([string]::IsNullOrWhiteSpace($TunnelId)) {
+    $OrganizationId = $OrganizationIdOverride
+    if ([string]::IsNullOrWhiteSpace($TunnelId) -or [string]::IsNullOrWhiteSpace($OrganizationId)) {
         $LocalConfigPath = Join-Path $RepoRoot 'config\team.ps1'
         if (-not (Test-Path -LiteralPath $LocalConfigPath)) { throw "Tunnel configuration not found: $LocalConfigPath" }
         . $LocalConfigPath
     }
     if ([string]::IsNullOrWhiteSpace($TunnelId) -or $TunnelId -cnotmatch '^tunnel_[0-9a-f]{32}$') {
         throw 'Tunnel ID is missing or invalid.'
+    }
+    if ([string]::IsNullOrWhiteSpace($OrganizationId) -or $OrganizationId -cnotmatch '^org-[A-Za-z0-9]{20,}$') {
+        throw 'Organization ID is missing or invalid.'
     }
 
     $ProxyCommandParts = @(
@@ -69,6 +74,7 @@ function Get-LazyRuntimeConfig {
         ProfileTemplatePath     = Join-Path $RepoRoot 'profiles\serena-team.yaml'
         ProfileDestinationPath  = Join-Path $env:APPDATA 'tunnel-client\dwb-serena.yaml'
         TunnelId                = $TunnelId
+        OrganizationId          = $OrganizationId
         IdleTimeoutMs           = $Script:LazyProductionDefaults.IdleTimeoutMs
         StartupTimeoutMs        = $Script:LazyProductionDefaults.StartupTimeoutMs
         StatusAddress           = $Script:LazyProductionDefaults.StatusAddress
@@ -121,12 +127,75 @@ function Write-LazyTunnelProfile {
     return $Content
 }
 
+function Get-LazyRuntimeStatePaths {
+    param([string]$AppDataRoot = $env:APPDATA)
+    $Base = Join-Path $AppDataRoot 'tunnel-client'
+    return [pscustomobject]@{
+        BaseDirectory       = $Base
+        TunnelPidPath       = Join-Path $Base 'dwb-serena-tunnel.pid'
+        TunnelClientPidPath = Join-Path $Base 'dwb-serena-tunnel-client.pid'
+        ProxyPidPath        = Join-Path $Base 'dwb-serena-proxy.pid'
+        SupervisorLogPath   = Join-Path $Base 'dwb-serena-supervisor.log'
+        BackupDirectory     = Join-Path $Base 'backups'
+    }
+}
+
+function Set-LazyPidFile {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [int]$ProcessId
+    )
+    $Directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $Directory | Out-Null
+    Set-Content -LiteralPath $Path -Value ([string]$ProcessId) -Encoding ascii -NoNewline
+}
+
+function Remove-LazyPidFileIfOwned {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [int]$ProcessId
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $Raw = Get-Content -Raw -LiteralPath $Path -ErrorAction SilentlyContinue
+    $ParsedId = 0
+    if ($Raw -and [int]::TryParse($Raw.Trim(), [ref]$ParsedId) -and $ParsedId -eq $ProcessId) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Write-LazySupervisorEvent {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Message,
+        [scriptblock]$NowProvider = { Get-Date }
+    )
+    $Directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $Directory | Out-Null
+
+    # Keep a single bounded previous log so a long-running supervisor cannot grow APPDATA without limit.
+    if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path).Length -ge 1048576) {
+        Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+    }
+
+    $Timestamp = (& $NowProvider).ToUniversalTime().ToString('o')
+    Add-Content -LiteralPath $Path -Encoding utf8 -Value "$Timestamp $Message"
+}
+
 function Get-DpapiApiKey {
     param([Parameter(Mandatory)] [string]$SecretPath)
     if (-not (Test-Path -LiteralPath $SecretPath)) { throw "DPAPI secret file not found: $SecretPath" }
     try {
         $EncryptedKey = (Get-Content -Raw -LiteralPath $SecretPath).Trim()
-        $SecureKey = ConvertTo-SecureString $EncryptedKey
+        $PreviousPSModulePath = $env:PSModulePath
+        try {
+            $env:PSModulePath = Join-Path $PSHOME 'Modules'
+            $SecurityModuleManifest = Join-Path $env:PSModulePath 'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+            Import-Module -Name $SecurityModuleManifest -Force -ErrorAction Stop
+            $SecureKey = ConvertTo-SecureString $EncryptedKey
+        }
+        finally {
+            $env:PSModulePath = $PreviousPSModulePath
+        }
         $PlaintextKey = [System.Net.NetworkCredential]::new('', $SecureKey).Password
     }
     catch {
@@ -141,6 +210,8 @@ function Start-LazyTunnel {
         [Parameter(Mandatory)] [string]$RepoRoot,
         [int]$MaxRestarts = 3,
         [int]$RestartWindowMinutes = 10,
+        [int]$InitialRestartDelaySeconds = 5,
+        [int]$MaxRestartDelaySeconds = 60,
         [switch]$Once,
         [scriptblock]$ConfigProvider = { param($RepoRootArg) Get-LazyRuntimeConfig -RepoRoot $RepoRootArg },
         [scriptblock]$ProcessLauncher = {
@@ -149,8 +220,15 @@ function Start-LazyTunnel {
             if ($WorkingDirectory) { $StartArguments['WorkingDirectory'] = $WorkingDirectory }
             Start-Process @StartArguments
         },
+        [scriptblock]$ProcessStarted = { param($Process, $ConfigArg) },
+        [scriptblock]$ProcessExited = { param($Process, $ExitCodeArg, $ConfigArg) },
+        [scriptblock]$Sleeper = { param($Seconds) Start-Sleep -Seconds $Seconds },
+        [scriptblock]$EventLogger = { param($Message) },
         [scriptblock]$NowProvider = { Get-Date }
     )
+
+    if ($InitialRestartDelaySeconds -lt 0) { throw 'InitialRestartDelaySeconds cannot be negative.' }
+    if ($MaxRestartDelaySeconds -lt $InitialRestartDelaySeconds) { throw 'MaxRestartDelaySeconds cannot be smaller than InitialRestartDelaySeconds.' }
 
     $Config = & $ConfigProvider $RepoRoot
     $ApiKey = Get-DpapiApiKey -SecretPath $Config.DpapiSecretPath
@@ -168,20 +246,31 @@ function Start-LazyTunnel {
             }
             $StartTimestamps = $Recent
             if ($StartTimestamps.Count -ge $MaxRestarts) {
+                try { & $EventLogger "restart-budget-exceeded count=$($StartTimestamps.Count) windowMinutes=$RestartWindowMinutes" } catch { }
                 throw "Lazy tunnel exceeded $MaxRestarts restarts within $RestartWindowMinutes minutes; stopping supervision."
             }
             $StartTimestamps.Add($Now)
 
             $env:CONTROL_PLANE_API_KEY = $ApiKey
+            $env:CONTROL_PLANE_ORGANIZATION_ID = $Config.OrganizationId
             try {
                 $WorkingDirectory = Split-Path -Parent $Config.TunnelClientPath
                 $Process = & $ProcessLauncher $Config.TunnelClientPath @('run', '--profile', 'dwb-serena') $WorkingDirectory
                 if ($Process) {
+                    try { & $EventLogger "tunnel-client-started pid=$($Process.Id)" } catch { }
+                    try { & $ProcessStarted $Process $Config } catch {
+                        try { & $EventLogger "process-started-callback-failed message=$($_.Exception.Message)" } catch { }
+                    }
                     $Process.WaitForExit()
                     $ExitCode = $Process.ExitCode
+                    try { & $EventLogger "tunnel-client-exited pid=$($Process.Id) code=$ExitCode" } catch { }
+                    try { & $ProcessExited $Process $ExitCode $Config } catch {
+                        try { & $EventLogger "process-exited-callback-failed message=$($_.Exception.Message)" } catch { }
+                    }
                 }
                 else {
                     $ExitCode = -1
+                    try { & $EventLogger 'tunnel-client-launch-returned-no-process' } catch { }
                 }
             }
             catch {
@@ -189,9 +278,18 @@ function Start-LazyTunnel {
                 # terminating PowerShell error under $ErrorActionPreference = 'Stop'.
                 $ExitCode = -1
                 Write-Warning "Lazy tunnel process failed: $($_.Exception.Message)"
+                try { & $EventLogger "tunnel-client-failed message=$($_.Exception.Message)" } catch { }
             }
             finally {
                 $env:CONTROL_PLANE_API_KEY = $null
+                $env:CONTROL_PLANE_ORGANIZATION_ID = $null
+            }
+
+            if (-not $Once -and $StartTimestamps.Count -lt $MaxRestarts -and $InitialRestartDelaySeconds -gt 0) {
+                $Exponent = [Math]::Max(0, $StartTimestamps.Count - 1)
+                $DelaySeconds = [Math]::Min($MaxRestartDelaySeconds, [int]($InitialRestartDelaySeconds * [Math]::Pow(2, $Exponent)))
+                try { & $EventLogger "restart-backoff seconds=$DelaySeconds" } catch { }
+                & $Sleeper $DelaySeconds
             }
         } while (-not $Once)
 
@@ -200,5 +298,6 @@ function Start-LazyTunnel {
     finally {
         $ApiKey = $null
         $env:CONTROL_PLANE_API_KEY = $null
+        $env:CONTROL_PLANE_ORGANIZATION_ID = $null
     }
 }
