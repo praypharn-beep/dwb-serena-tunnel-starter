@@ -162,17 +162,32 @@ mcp:
     Write-Host 'Checking tunnel-client accepts the rendered Windows executable path...'
     $TunnelClientPath = Join-Path $RepoRoot 'tunnel-client\tunnel-client.exe'
     if (Test-Path -LiteralPath $TunnelClientPath) {
-        $DoctorProfilePath = Join-Path (New-TrackedLazyTestDirectory) 'doctor-rendered.yaml'
-        Write-LazyTunnelProfile -TemplatePath $TemplatePath -DestinationPath $DoctorProfilePath -TunnelId $FakeTunnelId -ProxyCommand $Command | Out-Null
-        # Doctor binds the configured health listener. Use an ephemeral loopback port so this test
-        # never collides with the real production tunnel on 127.0.0.1:18010.
-        $EphemeralListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-        $EphemeralListener.Start()
-        $DoctorHealthPort = ([System.Net.IPEndPoint]$EphemeralListener.LocalEndpoint).Port
-        $EphemeralListener.Stop()
-        $DoctorProfileContent = Get-Content -Raw -LiteralPath $DoctorProfilePath
-        $DoctorProfileContent = $DoctorProfileContent.Replace('listen_addr: 127.0.0.1:18010', "listen_addr: 127.0.0.1:$DoctorHealthPort")
-        Set-Content -LiteralPath $DoctorProfilePath -Value $DoctorProfileContent -Encoding utf8 -NoNewline
+        $DoctorDirectory = New-TrackedLazyTestDirectory
+        $DoctorProfilePath = Join-Path $DoctorDirectory 'doctor-rendered.yaml'
+        $DoctorTemplatePath = Join-Path $DoctorDirectory 'doctor-template.yaml'
+
+        # Keep the production-template regression check on 18010 above, but isolate the doctor
+        # integration check from any production/runtime listener by asking the OS for an available
+        # loopback port and using it only in this temporary doctor-specific template.
+        $PortProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        try {
+            $PortProbe.Start()
+            $DoctorHealthPort = ([System.Net.IPEndPoint]$PortProbe.LocalEndpoint).Port
+        }
+        finally {
+            $PortProbe.Stop()
+        }
+        $DoctorHealthAddress = "127.0.0.1:$DoctorHealthPort"
+        $DoctorTemplate = (Get-Content -Raw -LiteralPath $TemplatePath).Replace(
+            'listen_addr: 127.0.0.1:18010',
+            "listen_addr: $DoctorHealthAddress"
+        )
+        Assert-True ($DoctorTemplate.Contains("listen_addr: $DoctorHealthAddress")) 'Doctor test setup must inject its isolated loopback health port.'
+        Assert-True (-not $DoctorTemplate.Contains('listen_addr: 127.0.0.1:18010')) 'Doctor integration config must not use the production health port.'
+        Set-Content -LiteralPath $DoctorTemplatePath -Encoding utf8 -Value $DoctorTemplate
+        Write-LazyTunnelProfile -TemplatePath $DoctorTemplatePath -DestinationPath $DoctorProfilePath -TunnelId $FakeTunnelId -ProxyCommand $Command | Out-Null
+        Write-Host "Doctor integration health port: $DoctorHealthAddress"
+
         $PreviousControlPlaneApiKey = $env:CONTROL_PLANE_API_KEY
         $env:CONTROL_PLANE_API_KEY = 'test-only-doctor-key'
         try {
