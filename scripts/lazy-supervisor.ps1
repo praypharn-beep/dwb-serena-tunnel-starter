@@ -61,14 +61,40 @@ $ProcessStarted = {
 $ProcessExited = {
     param($Process, $ExitCode, $Config)
     Remove-LazyPidFileIfOwned -Path $StatePaths.TunnelClientPidPath -ProcessId $Process.Id
+
+    $CleanupOk = $true
     if ($RunState.ProxyPid) {
-        $ProxyStillRunning = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($RunState.ProxyPid)" -ErrorAction SilentlyContinue
+        $ProxyPid = [int]$RunState.ProxyPid
+        $ProxyStillRunning = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProxyPid" -ErrorAction SilentlyContinue
         if (-not $ProxyStillRunning) {
-            Remove-LazyPidFileIfOwned -Path $StatePaths.ProxyPidPath -ProcessId $RunState.ProxyPid
+            Remove-LazyPidFileIfOwned -Path $StatePaths.ProxyPidPath -ProcessId $ProxyPid
             $RunState.ProxyPid = $null
         }
+        else {
+            $ManifestNeedle = $Config.ManifestPath.Replace('\', '/')
+            $StopResult = Stop-LazyVerifiedProcessTree -ProcessId $ProxyPid `
+                -ExpectedExecutablePath $Config.NodePath `
+                -ExpectedParentProcessId $Process.Id `
+                -RequiredCommandLineSubstrings @('cli.mjs', $ManifestNeedle)
+
+            if ($StopResult.Stopped) {
+                Remove-LazyPidFileIfOwned -Path $StatePaths.ProxyPidPath -ProcessId $ProxyPid
+                $RunState.ProxyPid = $null
+                & $EventLogger "orphan-proxy-stopped pid=$ProxyPid afterTunnelPid=$($Process.Id) forced=$($StopResult.Forced)"
+            }
+            elseif (-not $StopResult.Attempted) {
+                $CleanupOk = $false
+                & $EventLogger "orphan-proxy-identity-mismatch pid=$ProxyPid afterTunnelPid=$($Process.Id)"
+            }
+            else {
+                $CleanupOk = $false
+                & $EventLogger "orphan-proxy-stop-failed pid=$ProxyPid afterTunnelPid=$($Process.Id)"
+            }
+        }
     }
+
     $RunState.TunnelClientPid = $null
+    return $CleanupOk
 }.GetNewClosure()
 
 try {
