@@ -91,7 +91,7 @@ function New-FakeRuntimeConfig([string]$Directory, [string]$DestinationPath) {
         ProfileDestinationPath  = $DestinationPath
         TunnelId                = $FakeTunnelId
         IdleTimeoutMs           = 900000
-        StartupTimeoutMs        = 30000
+        StartupTimeoutMs        = 60000
         StatusAddress           = '127.0.0.1:18012'
         ProxyCommand            = $ProxyCommand
     }

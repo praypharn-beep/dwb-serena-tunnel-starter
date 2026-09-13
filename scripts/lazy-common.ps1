@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:LazyProductionDefaults = @{
     IdleTimeoutMs    = 900000
-    StartupTimeoutMs = 30000
+    StartupTimeoutMs = 60000
     StatusAddress    = '127.0.0.1:18012'
 }
 
@@ -310,6 +310,8 @@ function Start-LazyTunnel {
 
     $Config = & $ConfigProvider $RepoRoot
     $ApiKey = Get-DpapiApiKey -SecretPath $Config.DpapiSecretPath
+    $PreviousLazyIdleTimeoutMs = $env:LAZY_SERENA_IDLE_MS
+    $PreviousLazyStartupTimeoutMs = $env:LAZY_SERENA_STARTUP_MS
     try {
         Write-LazyTunnelProfile -TemplatePath $Config.ProfileTemplatePath -DestinationPath $Config.ProfileDestinationPath -TunnelId $Config.TunnelId -ProxyCommand $Config.ProxyCommand | Out-Null
 
@@ -331,6 +333,8 @@ function Start-LazyTunnel {
 
             $env:CONTROL_PLANE_API_KEY = $ApiKey
             $env:CONTROL_PLANE_ORGANIZATION_ID = $Config.OrganizationId
+            $env:LAZY_SERENA_IDLE_MS = [string]$Config.IdleTimeoutMs
+            $env:LAZY_SERENA_STARTUP_MS = [string]$Config.StartupTimeoutMs
             $RestartSafetyOk = $true
             $RestartSafetyMessage = $null
             try {
@@ -373,6 +377,8 @@ function Start-LazyTunnel {
             finally {
                 $env:CONTROL_PLANE_API_KEY = $null
                 $env:CONTROL_PLANE_ORGANIZATION_ID = $null
+                $env:LAZY_SERENA_IDLE_MS = $PreviousLazyIdleTimeoutMs
+                $env:LAZY_SERENA_STARTUP_MS = $PreviousLazyStartupTimeoutMs
             }
 
             if (-not $RestartSafetyOk) {
@@ -394,5 +400,7 @@ function Start-LazyTunnel {
         $ApiKey = $null
         $env:CONTROL_PLANE_API_KEY = $null
         $env:CONTROL_PLANE_ORGANIZATION_ID = $null
+        $env:LAZY_SERENA_IDLE_MS = $PreviousLazyIdleTimeoutMs
+        $env:LAZY_SERENA_STARTUP_MS = $PreviousLazyStartupTimeoutMs
     }
 }
