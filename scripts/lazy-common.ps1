@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:LazyProductionDefaults = @{
     IdleTimeoutMs    = 900000
-    StartupTimeoutMs = 30000
+    StartupTimeoutMs = 60000
     StatusAddress    = '127.0.0.1:18012'
 }
 
@@ -205,6 +205,84 @@ function Get-DpapiApiKey {
     return $PlaintextKey
 }
 
+function Stop-LazyVerifiedProcessTree {
+    <#
+    Stops one process tree only after re-validating that the PID still belongs to the exact
+    executable/command that this stack launched. This is used on the automatic restart path so a
+    tunnel-client exit cannot leave its stdio MCP child alive while a replacement tunnel starts.
+
+    The identity is checked before the graceful stop and again immediately before any forced stop
+    to protect against PID reuse. A failed identity check never kills anything.
+    #>
+    param(
+        [Parameter(Mandatory)] [int]$ProcessId,
+        [Parameter(Mandatory)] [string]$ExpectedExecutablePath,
+        [string[]]$RequiredCommandLineSubstrings = @(),
+        [int]$ExpectedParentProcessId = 0,
+        [scriptblock]$ProcessInspector = {
+            param($Id)
+            $Wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue
+            if (-not $Wmi) { return $null }
+            return [pscustomobject]@{
+                Id             = [int]$Wmi.ProcessId
+                ParentId       = [int]$Wmi.ParentProcessId
+                ExecutablePath = $Wmi.ExecutablePath
+                CommandLine    = $Wmi.CommandLine
+            }
+        },
+        [scriptblock]$GracefulStopper = {
+            param($Id)
+            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $Id, '/T') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+        },
+        [scriptblock]$ForceStopper = {
+            param($Id)
+            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $Id, '/T', '/F') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+        },
+        [int]$GracefulTimeoutMs = 5000,
+        [int]$PollIntervalMs = 250,
+        [scriptblock]$Sleeper = { param($Milliseconds) Start-Sleep -Milliseconds $Milliseconds },
+        [scriptblock]$NowProvider = { Get-Date }
+    )
+
+    $MatchesExpectedIdentity = {
+        param($Info)
+        if (-not $Info) { return $false }
+        if ([string]::IsNullOrWhiteSpace($Info.ExecutablePath) -or [string]::IsNullOrWhiteSpace($Info.CommandLine)) { return $false }
+        if ($Info.ExecutablePath -ine $ExpectedExecutablePath) { return $false }
+        if ($ExpectedParentProcessId -gt 0 -and [int]$Info.ParentId -ne $ExpectedParentProcessId) { return $false }
+        foreach ($Substring in $RequiredCommandLineSubstrings) {
+            if (-not $Info.CommandLine.Contains($Substring)) { return $false }
+        }
+        return $true
+    }.GetNewClosure()
+
+    $Initial = & $ProcessInspector $ProcessId
+    if (-not (& $MatchesExpectedIdentity $Initial)) {
+        return [pscustomobject]@{ Attempted = $false; Stopped = $false; Forced = $false }
+    }
+
+    & $GracefulStopper $ProcessId
+    $Deadline = (& $NowProvider).AddMilliseconds($GracefulTimeoutMs)
+    while ((& $NowProvider) -lt $Deadline) {
+        $Recheck = & $ProcessInspector $ProcessId
+        if (-not (& $MatchesExpectedIdentity $Recheck)) {
+            return [pscustomobject]@{ Attempted = $true; Stopped = $true; Forced = $false }
+        }
+        & $Sleeper $PollIntervalMs
+    }
+
+    # Re-verify immediately before force-killing; never act on a stale/reused PID.
+    $FinalCheck = & $ProcessInspector $ProcessId
+    if (& $MatchesExpectedIdentity $FinalCheck) {
+        & $ForceStopper $ProcessId
+        $AfterForce = & $ProcessInspector $ProcessId
+        $Stopped = -not (& $MatchesExpectedIdentity $AfterForce)
+        return [pscustomobject]@{ Attempted = $true; Stopped = $Stopped; Forced = $true }
+    }
+
+    return [pscustomobject]@{ Attempted = $true; Stopped = $true; Forced = $false }
+}
+
 function Start-LazyTunnel {
     param(
         [Parameter(Mandatory)] [string]$RepoRoot,
@@ -232,6 +310,8 @@ function Start-LazyTunnel {
 
     $Config = & $ConfigProvider $RepoRoot
     $ApiKey = Get-DpapiApiKey -SecretPath $Config.DpapiSecretPath
+    $PreviousLazyIdleTimeoutMs = $env:LAZY_SERENA_IDLE_MS
+    $PreviousLazyStartupTimeoutMs = $env:LAZY_SERENA_STARTUP_MS
     try {
         Write-LazyTunnelProfile -TemplatePath $Config.ProfileTemplatePath -DestinationPath $Config.ProfileDestinationPath -TunnelId $Config.TunnelId -ProxyCommand $Config.ProxyCommand | Out-Null
 
@@ -253,6 +333,10 @@ function Start-LazyTunnel {
 
             $env:CONTROL_PLANE_API_KEY = $ApiKey
             $env:CONTROL_PLANE_ORGANIZATION_ID = $Config.OrganizationId
+            $env:LAZY_SERENA_IDLE_MS = [string]$Config.IdleTimeoutMs
+            $env:LAZY_SERENA_STARTUP_MS = [string]$Config.StartupTimeoutMs
+            $RestartSafetyOk = $true
+            $RestartSafetyMessage = $null
             try {
                 $WorkingDirectory = Split-Path -Parent $Config.TunnelClientPath
                 $Process = & $ProcessLauncher $Config.TunnelClientPath @('run', '--profile', 'dwb-serena') $WorkingDirectory
@@ -264,7 +348,17 @@ function Start-LazyTunnel {
                     $Process.WaitForExit()
                     $ExitCode = $Process.ExitCode
                     try { & $EventLogger "tunnel-client-exited pid=$($Process.Id) code=$ExitCode" } catch { }
-                    try { & $ProcessExited $Process $ExitCode $Config } catch {
+                    try {
+                        $CleanupResult = & $ProcessExited $Process $ExitCode $Config
+                        if ($CleanupResult -is [bool] -and -not [bool]$CleanupResult) {
+                            $RestartSafetyOk = $false
+                            $RestartSafetyMessage = 'process-exit cleanup reported unsafe restart state'
+                            try { & $EventLogger 'process-exited-cleanup-blocked-restart' } catch { }
+                        }
+                    }
+                    catch {
+                        $RestartSafetyOk = $false
+                        $RestartSafetyMessage = "process-exit cleanup failed: $($_.Exception.Message)"
                         try { & $EventLogger "process-exited-callback-failed message=$($_.Exception.Message)" } catch { }
                     }
                 }
@@ -283,6 +377,13 @@ function Start-LazyTunnel {
             finally {
                 $env:CONTROL_PLANE_API_KEY = $null
                 $env:CONTROL_PLANE_ORGANIZATION_ID = $null
+                $env:LAZY_SERENA_IDLE_MS = $PreviousLazyIdleTimeoutMs
+                $env:LAZY_SERENA_STARTUP_MS = $PreviousLazyStartupTimeoutMs
+            }
+
+            if (-not $RestartSafetyOk) {
+                try { & $EventLogger "restart-blocked reason=$RestartSafetyMessage" } catch { }
+                throw "Unsafe restart blocked: $RestartSafetyMessage"
             }
 
             if (-not $Once -and $StartTimestamps.Count -lt $MaxRestarts -and $InitialRestartDelaySeconds -gt 0) {
@@ -299,5 +400,7 @@ function Start-LazyTunnel {
         $ApiKey = $null
         $env:CONTROL_PLANE_API_KEY = $null
         $env:CONTROL_PLANE_ORGANIZATION_ID = $null
+        $env:LAZY_SERENA_IDLE_MS = $PreviousLazyIdleTimeoutMs
+        $env:LAZY_SERENA_STARTUP_MS = $PreviousLazyStartupTimeoutMs
     }
 }

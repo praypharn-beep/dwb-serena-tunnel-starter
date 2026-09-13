@@ -348,7 +348,7 @@ test('CLI defaults launch the exact Serena MCP command with approved timeouts', 
   const syntaxResult = await new Promise(resolve => syntaxCheck.once('exit', code => resolve(code)));
   assert.equal(syntaxResult, 0, syntaxError);
   const { PRODUCTION_DEFAULTS } = await import('../cli.mjs');
-  assert.deepEqual(PRODUCTION_DEFAULTS, { idleTimeoutMs: 900000, startupTimeoutMs: 30000, statusAddress: '127.0.0.1:18012', maxQueuedCalls: 32 });
+  assert.deepEqual(PRODUCTION_DEFAULTS, { idleTimeoutMs: 900000, startupTimeoutMs: 60000, statusAddress: '127.0.0.1:18012', maxQueuedCalls: 32 });
 });
 
 test('SIGINT closes the downstream child', async () => {
