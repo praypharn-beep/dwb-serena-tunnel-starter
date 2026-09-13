@@ -140,7 +140,7 @@ mcp:
     Assert-True ($Config.ManifestPath -eq (Join-Path $RepoRoot 'lazy-proxy\serena-tools.json')) 'Get-LazyRuntimeConfig must resolve the Task 4 manifest path exactly.'
     Assert-True (Test-Path $Config.ManifestPath) 'The resolved manifest path must exist.'
     Assert-True ($Config.IdleTimeoutMs -eq 900000) 'The approved idle timeout is 900000 ms.'
-    Assert-True ($Config.StartupTimeoutMs -eq 30000) 'The approved startup timeout is 30000 ms.'
+    Assert-True ($Config.StartupTimeoutMs -eq 60000) 'The approved startup timeout is 60000 ms.'
     Assert-True ($Config.StatusAddress -eq '127.0.0.1:18012') 'The approved status address is 127.0.0.1:18012.'
 
     # Production-default regression check (not an injected mock): $Config above came from a real
@@ -294,9 +294,28 @@ catch {
         OrganizationId          = $FakeOrganizationId
         ProxyCommand            = $FakeProxyCommand
         IdleTimeoutMs           = 900000
-        StartupTimeoutMs        = 30000
+        StartupTimeoutMs        = 60000
         StatusAddress           = '127.0.0.1:18012'
     }
+    Write-Host 'Checking lazy proxy timeout settings are forwarded to the launched process...'
+    $PreviousLazyIdleTimeoutMs = $env:LAZY_SERENA_IDLE_MS
+    $PreviousLazyStartupTimeoutMs = $env:LAZY_SERENA_STARTUP_MS
+    $ObservedLazyTimeouts = @{ Idle = $null; Startup = $null }
+    $TimeoutObservingLauncher = {
+        param($FilePath, $ArgumentList, $WorkingDirectory)
+        $ObservedLazyTimeouts.Idle = $env:LAZY_SERENA_IDLE_MS
+        $ObservedLazyTimeouts.Startup = $env:LAZY_SERENA_STARTUP_MS
+        [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
+    }.GetNewClosure()
+    Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 1 -RestartWindowMinutes 10 -Once `
+        -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
+        -ProcessLauncher $TimeoutObservingLauncher `
+        -NowProvider { Get-Date } | Out-Null
+    Assert-True ($ObservedLazyTimeouts.Idle -eq '900000') 'The launched process must inherit LAZY_SERENA_IDLE_MS from the runtime config.'
+    Assert-True ($ObservedLazyTimeouts.Startup -eq '60000') 'The launched process must inherit LAZY_SERENA_STARTUP_MS from the runtime config.'
+    Assert-True ($env:LAZY_SERENA_IDLE_MS -eq $PreviousLazyIdleTimeoutMs) 'LAZY_SERENA_IDLE_MS must be restored after launch.'
+    Assert-True ($env:LAZY_SERENA_STARTUP_MS -eq $PreviousLazyStartupTimeoutMs) 'LAZY_SERENA_STARTUP_MS must be restored after launch.'
+
     # A Hashtable is used (rather than plain scalar variables) because Windows PowerShell 5.1's
     # GetNewClosure() detaches a scriptblock into its own private variable snapshot: writes made
     # to a $script:-scoped scalar from inside a closure do not propagate back to the caller. A

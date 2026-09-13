@@ -5,7 +5,7 @@ import { SerenaProcessManager } from './serena-process.mjs';
 import { createProxyServer } from './server.mjs';
 import { startStatusServer } from './status-server.mjs';
 
-export const PRODUCTION_DEFAULTS = Object.freeze({ idleTimeoutMs: 900000, startupTimeoutMs: 30000, statusAddress: '127.0.0.1:18012', maxQueuedCalls: 32 });
+export const PRODUCTION_DEFAULTS = Object.freeze({ idleTimeoutMs: 900000, startupTimeoutMs: 60000, statusAddress: '127.0.0.1:18012', maxQueuedCalls: 32 });
 export const PRODUCTION_SERENA_COMMAND = Object.freeze({ command: 'serena', args: Object.freeze(['start-mcp-server', '--context', 'chatgpt']) });
 
 function fail(message) {
