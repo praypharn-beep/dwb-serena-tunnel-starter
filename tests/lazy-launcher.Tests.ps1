@@ -348,6 +348,67 @@ catch {
     Assert-True (($Lifecycle.Logs -join "`n") -match 'tunnel-client-started pid=4321') 'EventLogger must receive a sanitized child-start event.'
     Assert-True (($Lifecycle.Logs -join "`n") -match 'tunnel-client-exited pid=4321 code=1') 'EventLogger must receive a sanitized child-exit event.'
 
+    Write-Host 'Checking verified orphan proxy cleanup before an automatic restart...'
+    $OwnedProxy = @{ Alive = $true; GracefulCalls = 0; ForceCalls = 0; FakeNow = Get-Date '2026-09-13T11:00:00' }
+    $OwnedProxyInspector = {
+        param($Id)
+        if (-not $OwnedProxy.Alive) { return $null }
+        return [pscustomobject]@{
+            Id = $Id
+            ParentId = 4321
+            ExecutablePath = 'C:\node.exe'
+            CommandLine = 'C:\node.exe D:/repo/lazy-proxy/cli.mjs --manifest D:/repo/lazy-proxy/serena-tools.json'
+        }
+    }.GetNewClosure()
+    $OwnedProxyResult = Stop-LazyVerifiedProcessTree -ProcessId 8765 `
+        -ExpectedExecutablePath 'C:\node.exe' -ExpectedParentProcessId 4321 `
+        -RequiredCommandLineSubstrings @('cli.mjs', 'D:/repo/lazy-proxy/serena-tools.json') `
+        -ProcessInspector $OwnedProxyInspector `
+        -GracefulStopper { param($Id) $OwnedProxy.GracefulCalls += 1; $OwnedProxy.Alive = $false }.GetNewClosure() `
+        -ForceStopper { param($Id) $OwnedProxy.ForceCalls += 1; $OwnedProxy.Alive = $false }.GetNewClosure() `
+        -Sleeper { param($Milliseconds) $OwnedProxy.FakeNow = $OwnedProxy.FakeNow.AddMilliseconds($Milliseconds) }.GetNewClosure() `
+        -NowProvider { $OwnedProxy.FakeNow }.GetNewClosure()
+    Assert-True $OwnedProxyResult.Attempted 'Verified orphan proxy cleanup must attempt to stop the exact owned proxy.'
+    Assert-True $OwnedProxyResult.Stopped 'Verified orphan proxy cleanup must confirm the old proxy is gone before restart.'
+    Assert-True (-not $OwnedProxyResult.Forced) 'A proxy that exits during the graceful tree stop must not be force-killed.'
+    Assert-True ($OwnedProxy.GracefulCalls -eq 1) 'Verified orphan proxy cleanup must request exactly one graceful tree stop.'
+    Assert-True ($OwnedProxy.ForceCalls -eq 0) 'Verified orphan proxy cleanup must not force-kill after graceful success.'
+
+    Write-Host 'Checking orphan cleanup refuses a PID whose live identity does not match...'
+    $MismatchStops = @{ Graceful = 0; Force = 0 }
+    $MismatchResult = Stop-LazyVerifiedProcessTree -ProcessId 8765 `
+        -ExpectedExecutablePath 'C:\node.exe' -ExpectedParentProcessId 4321 `
+        -RequiredCommandLineSubstrings @('cli.mjs') `
+        -ProcessInspector { param($Id) [pscustomobject]@{ Id = $Id; ParentId = 9999; ExecutablePath = 'C:\other.exe'; CommandLine = 'C:\other.exe' } } `
+        -GracefulStopper { param($Id) $MismatchStops.Graceful += 1 }.GetNewClosure() `
+        -ForceStopper { param($Id) $MismatchStops.Force += 1 }.GetNewClosure()
+    Assert-True (-not $MismatchResult.Attempted) 'Identity mismatch must never attempt to stop an unrelated process.'
+    Assert-True ($MismatchStops.Graceful -eq 0 -and $MismatchStops.Force -eq 0) 'Identity mismatch must leave the candidate process untouched.'
+
+    Write-Host 'Checking unsafe process-exit cleanup blocks restart instead of overlapping MCP children...'
+    $BlockedRestart = @{ LaunchCount = 0; FakeNow = Get-Date '2026-09-13T11:10:00'; Logs = New-Object System.Collections.Generic.List[string] }
+    $BlockedLauncher = {
+        param($FilePath, $ArgumentList, $WorkingDirectory)
+        $BlockedRestart.LaunchCount += 1
+        return [pscustomobject]@{ Id = 9911; ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
+    }.GetNewClosure()
+    $BlockedByCleanup = $false
+    try {
+        Start-LazyTunnel -RepoRoot $RepoRoot -MaxRestarts 3 -RestartWindowMinutes 10 `
+            -ConfigProvider { param($RepoRootArg) $FakeConfig }.GetNewClosure() `
+            -ProcessLauncher $BlockedLauncher `
+            -ProcessExited { param($Process, $ExitCodeArg, $ConfigArg) return $false } `
+            -EventLogger { param($Message) $BlockedRestart.Logs.Add([string]$Message) }.GetNewClosure() `
+            -Sleeper { param($Seconds) }.GetNewClosure() `
+            -NowProvider { $BlockedRestart.FakeNow }.GetNewClosure() | Out-Null
+    }
+    catch {
+        $BlockedByCleanup = ($_.Exception.Message -match 'Unsafe restart blocked')
+    }
+    Assert-True $BlockedByCleanup 'A failed process-exit cleanup must stop supervision before any replacement tunnel is launched.'
+    Assert-True ($BlockedRestart.LaunchCount -eq 1) 'Unsafe cleanup must block the second tunnel-client launch; overlap is forbidden.'
+    Assert-True (($BlockedRestart.Logs -join "`n") -match 'process-exited-cleanup-blocked-restart') 'The restart block must be visible in sanitized lifecycle diagnostics.'
+
     Write-Host 'Checking the sliding restart window expires old events...'
     $RestartState.LaunchCount = 0
     # A driven queue of exact timestamps (rather than "advance by 1 minute per launch") gives
